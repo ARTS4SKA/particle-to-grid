@@ -212,7 +212,9 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
                                       std::vector<T>   x,
                                       std::vector<T>   y,
                                       std::vector<T>   z,
-                                      std::vector<T>   mass)
+                                      std::vector<T>   mass,
+                                      bool doExchange,
+                                      bool doReset)
 {
     std::cout << "rank " << mesh.rank_ << " rasterize start (CUDA density)" << std::endl;
 
@@ -223,26 +225,21 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
     int      base      = gridDim / mesh.numRanks_;
     uint64_t localSize = static_cast<uint64_t>(gridDim) * gridDim * base;
 
-    // Ensure communication vectors are properly sized
     if (mesh.send_count.size() != static_cast<size_t>(mesh.numRanks_))
-    {
         mesh.resize_comm_size(mesh.numRanks_);
-    }
-    std::fill(mesh.send_count.begin(), mesh.send_count.end(), 0);
-    std::fill(mesh.send_disp.begin(), mesh.send_disp.end(), 0);
-    std::fill(mesh.recv_count.begin(), mesh.recv_count.end(), 0);
-    std::fill(mesh.recv_disp.begin(), mesh.recv_disp.end(), 0);
-    
-    for (int i = 0; i < mesh.numRanks_; i++)
-    {
-        mesh.vdataSender[i].send_index.clear();
-        mesh.vdataSender[i].send_dens.clear();
-    }
 
-    // Reset density field
-    if (mesh.dens_.size() != localSize)
+    if (doReset)
+        mesh.resetCommAndDens();
+    else
     {
-        mesh.dens_.assign(localSize, T(0));
+        if (mesh.currentGridSize() != localSize)
+            mesh.currentGrid().assign(localSize, T(0));
+        else
+            std::fill(mesh.currentGrid().begin(), mesh.currentGrid().end(), T(0));
+        size_t fi = mesh.current_field_index_;
+        for (int i = 0; i < mesh.numRanks_; i++)
+            if (fi < mesh.vdataSender[i].send_dens_per_field.size())
+                mesh.vdataSender[i].send_dens_per_field[fi].clear();
     }
 
     // Allocate device memory
@@ -267,7 +264,7 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
                    "Copying keys to device");
     checkCudaError(cudaMemcpy(d_mass, mass.data(), numParticles * sizeof(T), cudaMemcpyHostToDevice),
                    "Copying mass to device");
-    checkCudaError(cudaMemcpy(d_dens, mesh.dens_.data(), localSize * sizeof(T), cudaMemcpyHostToDevice),
+    checkCudaError(cudaMemcpy(d_dens, mesh.currentGridData(), localSize * sizeof(T), cudaMemcpyHostToDevice),
                    "Copying initial density to device");
     
     int zeroCount = 0;
@@ -284,7 +281,7 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
     checkCudaError(cudaDeviceSynchronize(), "classifyAndRasterizeKernel execution");
 
     // Copy back local density and remote count
-    checkCudaError(cudaMemcpy(mesh.dens_.data(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost),
+    checkCudaError(cudaMemcpy(mesh.currentGridData(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost),
                    "Copying density back to host");
     
     int h_remoteCount = 0;
@@ -311,7 +308,7 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
             int targetRank = h_remoteRanks[i];
             mesh.send_count[targetRank]++;
             mesh.vdataSender[targetRank].send_index.push_back(h_remoteIndices[i]);
-            mesh.vdataSender[targetRank].send_dens.push_back(h_remoteMass[i]);
+            mesh.vdataSender[targetRank].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
         }
     }
 
@@ -321,94 +318,72 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
     cudaFree(d_remoteMass);
     cudaFree(d_remoteCount);
 
-    // MPI Communication (same as CPU version)
-    MPI_Alltoall(mesh.send_count.data(), 1, MpiType<int>{}, mesh.recv_count.data(), 1, MpiType<int>{}, MPI_COMM_WORLD);
-
-    for (int i = 0; i < mesh.numRanks_; i++)
+    if (doExchange)
     {
-        mesh.send_disp[i + 1] = mesh.send_disp[i] + mesh.send_count[i];
-        mesh.recv_disp[i + 1] = mesh.recv_disp[i] + mesh.recv_count[i];
-    }
-
-    // Prepare send buffers
-    mesh.send_index.resize(mesh.send_disp[mesh.numRanks_]);
-    mesh.send_dens.resize(mesh.send_disp[mesh.numRanks_]);
-
-    for (int i = 0; i < mesh.numRanks_; i++)
-    {
-        for (int j = mesh.send_disp[i]; j < mesh.send_disp[i + 1]; j++)
+        MPI_Alltoall(mesh.send_count.data(), 1, MpiType<int>{}, mesh.recv_count.data(), 1, MpiType<int>{}, MPI_COMM_WORLD);
+        for (int i = 0; i < mesh.numRanks_; i++)
         {
-            mesh.send_index[j] = mesh.vdataSender[i].send_index[j - mesh.send_disp[i]];
-            mesh.send_dens[j]  = mesh.vdataSender[i].send_dens[j - mesh.send_disp[i]];
+            mesh.send_disp[i + 1] = mesh.send_disp[i] + mesh.send_count[i];
+            mesh.recv_disp[i + 1] = mesh.recv_disp[i] + mesh.recv_count[i];
+        }
+        mesh.send_index.resize(mesh.send_disp[mesh.numRanks_]);
+        mesh.send_dens.resize(mesh.send_disp[mesh.numRanks_]);
+        size_t fi = mesh.current_field_index_;
+        for (int i = 0; i < mesh.numRanks_; i++)
+            for (size_t j = mesh.send_disp[i]; j < mesh.send_disp[i + 1]; j++)
+            {
+                mesh.send_index[j] = mesh.vdataSender[i].send_index[j - mesh.send_disp[i]];
+                mesh.send_dens[j]  = mesh.vdataSender[i].send_dens_per_field[fi][j - mesh.send_disp[i]];
+            }
+        mesh.recv_index.resize(mesh.recv_disp[mesh.numRanks_]);
+        mesh.recv_dens.resize(mesh.recv_disp[mesh.numRanks_]);
+        MPI_Alltoallv(mesh.send_index.data(), mesh.send_count.data(), mesh.send_disp.data(), MpiType<uint64_t>{},
+                      mesh.recv_index.data(), mesh.recv_count.data(), mesh.recv_disp.data(), MpiType<uint64_t>{}, MPI_COMM_WORLD);
+        MPI_Alltoallv(mesh.send_dens.data(), mesh.send_count.data(), mesh.send_disp.data(), MpiType<T>{},
+                      mesh.recv_dens.data(), mesh.recv_count.data(), mesh.recv_disp.data(), MpiType<T>{}, MPI_COMM_WORLD);
+        if (mesh.recv_disp[mesh.numRanks_] > 0)
+        {
+            uint64_t* d_recvIndices = nullptr;
+            T*        d_recvMass = nullptr;
+            checkCudaError(cudaMalloc(&d_recvIndices, mesh.recv_disp[mesh.numRanks_] * sizeof(uint64_t)), "d_recvIndices");
+            checkCudaError(cudaMalloc(&d_recvMass, mesh.recv_disp[mesh.numRanks_] * sizeof(T)), "d_recvMass");
+            checkCudaError(cudaMemcpy(d_recvIndices, mesh.recv_index.data(), mesh.recv_disp[mesh.numRanks_] * sizeof(uint64_t), cudaMemcpyHostToDevice), "");
+            checkCudaError(cudaMemcpy(d_recvMass, mesh.recv_dens.data(), mesh.recv_disp[mesh.numRanks_] * sizeof(T), cudaMemcpyHostToDevice), "");
+            checkCudaError(cudaMemcpy(d_dens, mesh.currentGridData(), localSize * sizeof(T), cudaMemcpyHostToDevice), "");
+            int recvBlocks = (mesh.recv_disp[mesh.numRanks_] + threadsPerBlock - 1) / threadsPerBlock;
+            accumulateReceivedKernel<<<recvBlocks, threadsPerBlock>>>(d_recvIndices, d_recvMass, mesh.recv_disp[mesh.numRanks_], d_dens);
+            checkCudaError(cudaDeviceSynchronize(), "accumulateReceivedKernel");
+            checkCudaError(cudaMemcpy(mesh.currentGridData(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost), "");
+            cudaFree(d_recvIndices);
+            cudaFree(d_recvMass);
+        }
+        mesh.convertMassToDensity();
+        for (int i = 0; i < mesh.numRanks_; i++)
+        {
+            mesh.vdataSender[i].send_index.clear();
+            for (auto& v : mesh.vdataSender[i].send_dens_per_field)
+                v.clear();
         }
     }
 
-    // Prepare receive buffers
-    mesh.recv_index.resize(mesh.recv_disp[mesh.numRanks_]);
-    mesh.recv_dens.resize(mesh.recv_disp[mesh.numRanks_]);
-
-    MPI_Alltoallv(mesh.send_index.data(), mesh.send_count.data(), mesh.send_disp.data(), MpiType<uint64_t>{}, 
-                  mesh.recv_index.data(), mesh.recv_count.data(), mesh.recv_disp.data(), MpiType<uint64_t>{}, MPI_COMM_WORLD);
-    MPI_Alltoallv(mesh.send_dens.data(), mesh.send_count.data(), mesh.send_disp.data(), MpiType<T>{}, 
-                  mesh.recv_dens.data(), mesh.recv_count.data(), mesh.recv_disp.data(), MpiType<T>{}, MPI_COMM_WORLD);
-
-    // Accumulate received contributions on GPU
-    if (mesh.recv_disp[mesh.numRanks_] > 0)
-    {
-        uint64_t* d_recvIndices = nullptr;
-        T*        d_recvMass = nullptr;
-
-        checkCudaError(cudaMalloc(&d_recvIndices, mesh.recv_disp[mesh.numRanks_] * sizeof(uint64_t)),
-                       "Allocating d_recvIndices");
-        checkCudaError(cudaMalloc(&d_recvMass, mesh.recv_disp[mesh.numRanks_] * sizeof(T)),
-                       "Allocating d_recvMass");
-
-        checkCudaError(cudaMemcpy(d_recvIndices, mesh.recv_index.data(), mesh.recv_disp[mesh.numRanks_] * sizeof(uint64_t), cudaMemcpyHostToDevice),
-                       "Copying recv indices to device");
-        checkCudaError(cudaMemcpy(d_recvMass, mesh.recv_dens.data(), mesh.recv_disp[mesh.numRanks_] * sizeof(T), cudaMemcpyHostToDevice),
-                       "Copying recv mass to device");
-
-        // Update density on device
-        checkCudaError(cudaMemcpy(d_dens, mesh.dens_.data(), localSize * sizeof(T), cudaMemcpyHostToDevice),
-                       "Copying density to device for accumulation");
-
-        int recvBlocks = (mesh.recv_disp[mesh.numRanks_] + threadsPerBlock - 1) / threadsPerBlock;
-        accumulateReceivedKernel<<<recvBlocks, threadsPerBlock>>>(
-            d_recvIndices, d_recvMass, mesh.recv_disp[mesh.numRanks_], d_dens);
-        checkCudaError(cudaDeviceSynchronize(), "accumulateReceivedKernel execution");
-
-        checkCudaError(cudaMemcpy(mesh.dens_.data(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost),
-                       "Copying final density back to host");
-
-        cudaFree(d_recvIndices);
-        cudaFree(d_recvMass);
-    }
-
-    // Free device memory
     cudaFree(d_keys);
     cudaFree(d_mass);
     cudaFree(d_dens);
-
-    // Clear particle buffers
-    x.clear();
-    y.clear();
-    z.clear();
-    mass.clear();
-    keys.clear();
-
-    // Clear send buffers
-    for (int i = 0; i < mesh.numRanks_; i++)
+    if (doExchange)
     {
-        mesh.vdataSender[i].send_index.clear();
-        mesh.vdataSender[i].send_dens.clear();
+        x.clear();
+        y.clear();
+        z.clear();
+        mass.clear();
+        keys.clear();
     }
-
     std::cout << "rank " << mesh.rank_ << " rasterize (CUDA nearest) done" << std::endl;
 }
 
 template<typename T>
 void rasterize_particles_to_mesh_cuda_cell_average(p2g::Mesh<T>& mesh, std::vector<T> x, std::vector<T> y,
-                                                   std::vector<T> z, std::vector<T> mass)
+                                                   std::vector<T> z, std::vector<T> mass,
+                                                   bool doExchange, bool doReset)
 {
     std::cout << "rank " << mesh.rank_ << " rasterize (CUDA cell_average) start" << std::endl;
     int numParticles = static_cast<int>(x.size());
@@ -420,7 +395,15 @@ void rasterize_particles_to_mesh_cuda_cell_average(p2g::Mesh<T>& mesh, std::vect
     T        dx        = (mesh.Lmax_ - mesh.Lmin_) / static_cast<T>(gridDim);
 
     if (mesh.send_count.size() != static_cast<size_t>(mesh.numRanks_)) mesh.resize_comm_size(mesh.numRanks_);
-    mesh.resetCommAndDens();
+    if (doReset) mesh.resetCommAndDens();
+    else
+    {
+        mesh.currentGrid().assign(localSize, T(0));
+        size_t fi = mesh.current_field_index_;
+        for (int i = 0; i < mesh.numRanks_; i++)
+            if (fi < mesh.vdataSender[i].send_dens_per_field.size())
+                mesh.vdataSender[i].send_dens_per_field[fi].clear();
+    }
 
     T* d_x = nullptr, * d_y = nullptr, * d_z = nullptr, * d_mass = nullptr, * d_dens = nullptr;
     int* d_remoteRanks = nullptr;
@@ -442,7 +425,7 @@ void rasterize_particles_to_mesh_cuda_cell_average(p2g::Mesh<T>& mesh, std::vect
     checkCudaError(cudaMemcpy(d_y, y.data(), numParticles * sizeof(T), cudaMemcpyHostToDevice), "copy y");
     checkCudaError(cudaMemcpy(d_z, z.data(), numParticles * sizeof(T), cudaMemcpyHostToDevice), "copy z");
     checkCudaError(cudaMemcpy(d_mass, mass.data(), numParticles * sizeof(T), cudaMemcpyHostToDevice), "copy mass");
-    checkCudaError(cudaMemcpy(d_dens, mesh.dens_.data(), localSize * sizeof(T), cudaMemcpyHostToDevice), "copy dens");
+    checkCudaError(cudaMemcpy(d_dens, mesh.currentGridData(), localSize * sizeof(T), cudaMemcpyHostToDevice), "copy dens");
     int zero = 0;
     checkCudaError(cudaMemcpy(d_remoteCount, &zero, sizeof(int), cudaMemcpyHostToDevice), "remote count");
 
@@ -453,7 +436,7 @@ void rasterize_particles_to_mesh_cuda_cell_average(p2g::Mesh<T>& mesh, std::vect
         mesh.Lmin_, dx, d_dens, d_remoteRanks, d_remoteIndices, d_remoteMass, d_remoteCount);
     checkCudaError(cudaDeviceSynchronize(), "cell average kernel");
 
-    checkCudaError(cudaMemcpy(mesh.dens_.data(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost), "dens back");
+    checkCudaError(cudaMemcpy(mesh.currentGridData(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost), "dens back");
     int h_remoteCount = 0;
     checkCudaError(cudaMemcpy(&h_remoteCount, d_remoteCount, sizeof(int), cudaMemcpyDeviceToHost), "remote count back");
 
@@ -469,22 +452,26 @@ void rasterize_particles_to_mesh_cuda_cell_average(p2g::Mesh<T>& mesh, std::vect
         {
             mesh.send_count[h_remoteRanks[i]]++;
             mesh.vdataSender[h_remoteRanks[i]].send_index.push_back(h_remoteIndices[i]);
-            mesh.vdataSender[h_remoteRanks[i]].send_dens.push_back(h_remoteMass[i]);
+            mesh.vdataSender[h_remoteRanks[i]].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
         }
     }
 
     cudaFree(d_x); cudaFree(d_y); cudaFree(d_z); cudaFree(d_mass); cudaFree(d_remoteRanks);
     cudaFree(d_remoteIndices); cudaFree(d_remoteMass); cudaFree(d_remoteCount);
 
-    mesh.performExchangeAndAccumulate();
-    mesh.convertMassToDensity();
+    if (doExchange)
+    {
+        mesh.performExchangeAndAccumulate();
+        mesh.convertMassToDensity();
+    }
     cudaFree(d_dens);
     std::cout << "rank " << mesh.rank_ << " rasterize (CUDA cell_average) done" << std::endl;
 }
 
 template<typename T>
 void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, std::vector<T> y, std::vector<T> z,
-                                          const std::vector<T>& h, std::vector<T> mass)
+                                          const std::vector<T>& h, std::vector<T> mass,
+                                          bool doExchange, bool doReset)
 {
     std::cout << "rank " << mesh.rank_ << " rasterize (CUDA sph) start" << std::endl;
     int numParticles = static_cast<int>(x.size());
@@ -497,7 +484,15 @@ void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, 
     int      maxRemote = numParticles * MAX_SPH_REMOTE_PER_PARTICLE;
 
     if (mesh.send_count.size() != static_cast<size_t>(mesh.numRanks_)) mesh.resize_comm_size(mesh.numRanks_);
-    mesh.resetCommAndDens();
+    if (doReset) mesh.resetCommAndDens();
+    else
+    {
+        mesh.currentGrid().assign(localSize, T(0));
+        size_t fi = mesh.current_field_index_;
+        for (int i = 0; i < mesh.numRanks_; i++)
+            if (fi < mesh.vdataSender[i].send_dens_per_field.size())
+                mesh.vdataSender[i].send_dens_per_field[fi].clear();
+    }
 
     T* d_x = nullptr, * d_y = nullptr, * d_z = nullptr, * d_h = nullptr, * d_mass = nullptr, * d_dens = nullptr;
     int* d_remoteRanks = nullptr;
@@ -521,7 +516,7 @@ void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, 
     checkCudaError(cudaMemcpy(d_z, z.data(), numParticles * sizeof(T), cudaMemcpyHostToDevice), "copy z");
     checkCudaError(cudaMemcpy(d_h, h.data(), numParticles * sizeof(T), cudaMemcpyHostToDevice), "copy h");
     checkCudaError(cudaMemcpy(d_mass, mass.data(), numParticles * sizeof(T), cudaMemcpyHostToDevice), "copy mass");
-    checkCudaError(cudaMemcpy(d_dens, mesh.dens_.data(), localSize * sizeof(T), cudaMemcpyHostToDevice), "copy dens");
+    checkCudaError(cudaMemcpy(d_dens, mesh.currentGridData(), localSize * sizeof(T), cudaMemcpyHostToDevice), "copy dens");
     int zero = 0;
     checkCudaError(cudaMemcpy(d_remoteCount, &zero, sizeof(int), cudaMemcpyHostToDevice), "remote count");
 
@@ -532,7 +527,7 @@ void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, 
         mesh.Lmin_, dx, d_dens, d_remoteRanks, d_remoteIndices, d_remoteMass, d_remoteCount, maxRemote);
     checkCudaError(cudaDeviceSynchronize(), "sph kernel");
 
-    checkCudaError(cudaMemcpy(mesh.dens_.data(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost), "dens back");
+    checkCudaError(cudaMemcpy(mesh.currentGridData(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost), "dens back");
     int h_remoteCount = 0;
     checkCudaError(cudaMemcpy(&h_remoteCount, d_remoteCount, sizeof(int), cudaMemcpyDeviceToHost), "remote count back");
     if (h_remoteCount > maxRemote && mesh.rank_ == 0)
@@ -551,31 +546,24 @@ void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, 
         {
             mesh.send_count[h_remoteRanks[i]]++;
             mesh.vdataSender[h_remoteRanks[i]].send_index.push_back(h_remoteIndices[i]);
-            mesh.vdataSender[h_remoteRanks[i]].send_dens.push_back(h_remoteMass[i]);
+            mesh.vdataSender[h_remoteRanks[i]].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
         }
     }
 
     cudaFree(d_x); cudaFree(d_y); cudaFree(d_z); cudaFree(d_h); cudaFree(d_mass);
     cudaFree(d_remoteRanks); cudaFree(d_remoteIndices); cudaFree(d_remoteMass); cudaFree(d_remoteCount);
 
-    mesh.performExchangeAndAccumulate();
-    // SPH: dens_ already holds density (mass*W), do not divide by cell volume
+    if (doExchange) mesh.performExchangeAndAccumulate();
     cudaFree(d_dens);
     std::cout << "rank " << mesh.rank_ << " rasterize (CUDA sph) done" << std::endl;
 }
 
 // Explicit template instantiation for double
-template void rasterize_particles_to_mesh_cuda<double>(p2g::Mesh<double>&,
-                                                       std::vector<KeyType>,
-                                                       std::vector<double>,
-                                                       std::vector<double>,
-                                                       std::vector<double>,
-                                                       std::vector<double>);
+template void rasterize_particles_to_mesh_cuda<double>(p2g::Mesh<double>&, std::vector<KeyType>,
+    std::vector<double>, std::vector<double>, std::vector<double>, std::vector<double>, bool, bool);
 template void rasterize_particles_to_mesh_cuda_cell_average<double>(p2g::Mesh<double>&, std::vector<double>,
-                                                                    std::vector<double>, std::vector<double>,
-                                                                    std::vector<double>);
+    std::vector<double>, std::vector<double>, std::vector<double>, bool, bool);
 template void rasterize_particles_to_mesh_cuda_sph<double>(p2g::Mesh<double>&, std::vector<double>, std::vector<double>,
-                                                           std::vector<double>, const std::vector<double>&,
-                                                           std::vector<double>);
+    std::vector<double>, const std::vector<double>&, std::vector<double>, bool, bool);
 
 

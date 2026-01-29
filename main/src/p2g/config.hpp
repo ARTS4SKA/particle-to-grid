@@ -3,18 +3,20 @@
 #include "p2g/interpolation_method.hpp"
 
 #include <string>
+#include <vector>
 
 namespace p2g {
 
 struct Config
 {
-    std::string         checkpoint_path;
-    std::string         checkpoint_type = "hdf5";
-    int                 step_no         = 0;
-    int                 grid_size       = 0;
-    double              lbox            = 0.0;
-    double              rho_crit        = 0.0;
-    InterpolationMethod interpolation   = InterpolationMethod::NearestNeighbor;
+    std::string                  checkpoint_path;
+    std::string                  checkpoint_type = "hdf5";
+    int                          step_no         = 0;
+    int                          grid_size       = 0;
+    double                       lbox            = 0.0;
+    double                       rho_crit        = 0.0;
+    InterpolationMethod          interpolation   = InterpolationMethod::NearestNeighbor;
+    std::vector<std::string>     extra_field_names;  // e.g. {"temp", "vx"} for additional quantities to rasterize
 };
 
 /** Validates config. On failure, sets errMsg (on rank 0) and returns false. */

@@ -24,8 +24,9 @@ public:
 
     // coordinate centers in the mesh
     std::vector<T> x_;
-    // density field per mesh cell
-    std::vector<T> dens_;
+    // grid fields: [0] = density (or first quantity), [1..] = extra quantities (e.g. temperature)
+    std::vector<std::vector<T>> grid_fields_;
+    size_t current_field_index_{0};
 
     // communication counters
     std::vector<int> send_disp;  //(numRanks_+1, 0);
@@ -54,6 +55,32 @@ public:
     {
         initCartesianGrid();
     }
+
+    // Multi-field support: ensure at least @a n grid fields (each of local size) and exchange buffers.
+    void ensureNumFields(size_t n)
+    {
+        if (grid_fields_.size() < n)
+            grid_fields_.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            if (grid_fields_[i].size() != localSize_)
+                grid_fields_[i].assign(localSize_, T{0});
+        for (int r = 0; r < numRanks_; ++r)
+            if (vdataSender[r].send_dens_per_field.size() != n)
+                vdataSender[r].send_dens_per_field.resize(n);
+    }
+
+    void setOutputFieldIndex(size_t i) { current_field_index_ = i; }
+    size_t numFields() const { return grid_fields_.size(); }
+
+    // First grid field (density); backward compatibility.
+    std::vector<T>& dens() { return grid_fields_[0]; }
+    std::vector<T> const& dens() const { return grid_fields_[0]; }
+
+    // Current grid (used during rasterize for the active quantity).
+    std::vector<T>& currentGrid() { return grid_fields_[current_field_index_]; }
+    std::vector<T> const& currentGrid() const { return grid_fields_[current_field_index_]; }
+    T* currentGridData() { return grid_fields_[current_field_index_].data(); }
+    size_t currentGridSize() const { return grid_fields_[current_field_index_].size(); }
 
     void rasterize_particles_to_mesh(std::vector<KeyType> keys, std::vector<T> x, std::vector<T> y, std::vector<T> z,
                                      std::vector<T> mass)
@@ -86,22 +113,36 @@ public:
 
         if (targetRank == rank_)
         {
-            // if the corresponding mesh cell belongs to this rank
             uint64_t index = targetIndex;
-            if (index >= dens_.size())
-            {
-                std::cout << "rank = " << rank_ << " index = " << index << " size " << dens_.size() << std::endl;
-            }
-
-            // local accumulation into density field
-            dens_[index] += densContribution;
+            if (index >= currentGrid().size())
+                std::cout << "rank = " << rank_ << " index = " << index << " size " << currentGrid().size() << std::endl;
+            currentGrid()[index] += densContribution;
         }
         else
         {
-            // if the corresponding mesh cell belongs another rank
             send_count[targetRank]++;
             vdataSender[targetRank].send_index.push_back(targetIndex);
-            vdataSender[targetRank].send_dens.push_back(densContribution);
+            vdataSender[targetRank].send_dens_per_field[current_field_index_].push_back(densContribution);
+        }
+    }
+
+    // Multi-field: one (i,j,k) contribution for all fields; same indices, values per field.
+    void assignValuesByMeshCoord(int meshiIndex, int meshjIndex, int meshkIndex, const T* values, size_t numFields)
+    {
+        int      targetRank  = calculateRankFromMeshCoord(meshkIndex);
+        uint64_t targetIndex = calculateInboxIndexFromMeshCoord(meshiIndex, meshjIndex, meshkIndex);
+
+        if (targetRank == rank_)
+        {
+            for (size_t f = 0; f < numFields; f++)
+                grid_fields_[f][targetIndex] += values[f];
+        }
+        else
+        {
+            send_count[targetRank]++;
+            vdataSender[targetRank].send_index.push_back(targetIndex);
+            for (size_t f = 0; f < numFields; f++)
+                vdataSender[targetRank].send_dens_per_field[f].push_back(values[f]);
         }
     }
 
@@ -110,13 +151,19 @@ public:
     {
         T cellSize = (Lmax_ - Lmin_) / static_cast<T>(gridDim_);
         T cellVolume = cellSize * cellSize * cellSize;
+#pragma omp parallel for
+        for (size_t i = 0; i < currentGrid().size(); ++i)
+            currentGrid()[i] /= cellVolume;
+    }
 
-    #pragma omp parallel for
-        for (size_t i = 0; i < dens_.size(); ++i)
-        {
-            dens_[i] /= cellVolume;
-        }
-        // std::cout << "rank " << rank_ << " convertMassToDensity done" << std::endl;
+    void convertMassToDensityAllFields(size_t numFields)
+    {
+        T cellSize   = (Lmax_ - Lmin_) / static_cast<T>(gridDim_);
+        T cellVolume = cellSize * cellSize * cellSize;
+        for (size_t f = 0; f < numFields; f++)
+#pragma omp parallel for
+            for (size_t i = 0; i < grid_fields_[f].size(); ++i)
+                grid_fields_[f][i] /= cellVolume;
     }
 
     void setSimBox(T Lmin, T Lmax)
@@ -131,8 +178,10 @@ public:
         send_count.resize(size, 0);
         recv_disp.resize(size + 1, 0);
         recv_count.resize(size, 0);
-
         vdataSender.resize(size);
+        for (int i = 0; i < size; i++)
+            if (vdataSender[i].send_dens_per_field.empty())
+                vdataSender[i].send_dens_per_field.resize(1);
     }
 
     inline int calculateRankFromMeshCoord(int k)
@@ -175,8 +224,8 @@ public:
 
     void resetCommAndDens()
     {
-        if (dens_.size() != localSize_) dens_.assign(localSize_, T{0});
-        else std::fill(dens_.begin(), dens_.end(), T(0));
+        if (currentGrid().size() != localSize_) currentGrid().assign(localSize_, T{0});
+        else std::fill(currentGrid().begin(), currentGrid().end(), T(0));
         std::fill(send_count.begin(), send_count.end(), 0);
         std::fill(send_disp.begin(), send_disp.end(), 0);
         std::fill(recv_count.begin(), recv_count.end(), 0);
@@ -184,11 +233,47 @@ public:
         for (int i = 0; i < numRanks_; i++)
         {
             vdataSender[i].send_index.clear();
-            vdataSender[i].send_dens.clear();
+            for (auto& v : vdataSender[i].send_dens_per_field)
+                v.clear();
         }
     }
 
+    // Clear only current grid and current field's send buffer (for multi-field CUDA steps).
+    void resetCommAndDensForField(size_t field_index)
+    {
+        if (grid_fields_[field_index].size() != localSize_)
+            grid_fields_[field_index].assign(localSize_, T{0});
+        else
+            std::fill(grid_fields_[field_index].begin(), grid_fields_[field_index].end(), T(0));
+        if (field_index == 0)
+        {
+            std::fill(send_count.begin(), send_count.end(), 0);
+            std::fill(send_disp.begin(), send_disp.end(), 0);
+            std::fill(recv_count.begin(), recv_count.end(), 0);
+            std::fill(recv_disp.begin(), recv_disp.end(), 0);
+            for (int i = 0; i < numRanks_; i++)
+            {
+                vdataSender[i].send_index.clear();
+                for (auto& v : vdataSender[i].send_dens_per_field)
+                    v.clear();
+            }
+        }
+        else
+        {
+            for (int i = 0; i < numRanks_; i++)
+                if (field_index < vdataSender[i].send_dens_per_field.size())
+                    vdataSender[i].send_dens_per_field[field_index].clear();
+        }
+    }
+
+    // Single-field exchange (numFields == 1); backward compatible.
     void performExchangeAndAccumulate()
+    {
+        performExchangeAndAccumulate(1);
+    }
+
+    // Multi-field exchange: one Alltoallv for indices, one for packed values (all fields).
+    void performExchangeAndAccumulate(size_t numFields)
     {
         MPI_Alltoall(send_count.data(), 1, MpiType<int>{}, recv_count.data(), 1, MpiType<int>{}, MPI_COMM_WORLD);
         for (int i = 0; i < numRanks_; i++)
@@ -196,28 +281,59 @@ public:
             send_disp[i + 1] = send_disp[i] + send_count[i];
             recv_disp[i + 1] = recv_disp[i] + recv_count[i];
         }
-        send_index.resize(send_disp[numRanks_]);
-        send_dens.resize(send_disp[numRanks_]);
+        const size_t totalSend = send_disp[numRanks_];
+        const size_t totalRecv = recv_disp[numRanks_];
+        send_index.resize(totalSend);
+        recv_index.resize(totalRecv);
         for (int i = 0; i < numRanks_; i++)
-            for (int j = send_disp[i]; j < send_disp[i + 1]; j++)
-            {
+            for (size_t j = send_disp[i]; j < send_disp[i + 1]; j++)
                 send_index[j] = vdataSender[i].send_index[j - send_disp[i]];
-                send_dens[j]  = vdataSender[i].send_dens[j - send_disp[i]];
-            }
-        recv_index.resize(recv_disp[numRanks_]);
-        recv_dens.resize(recv_disp[numRanks_]);
         MPI_Alltoallv(send_index.data(), send_count.data(), send_disp.data(), MpiType<uint64_t>{},
                       recv_index.data(), recv_count.data(), recv_disp.data(), MpiType<uint64_t>{}, MPI_COMM_WORLD);
-        MPI_Alltoallv(send_dens.data(), send_count.data(), send_disp.data(), MpiType<T>{},
-                      recv_dens.data(), recv_count.data(), recv_disp.data(), MpiType<T>{}, MPI_COMM_WORLD);
-        for (int i = 0; i < recv_disp[numRanks_]; i++)
-            dens_[recv_index[i]] += recv_dens[i];
+
+        if (numFields == 1)
+        {
+            send_dens.resize(totalSend);
+            recv_dens.resize(totalRecv);
+            for (int i = 0; i < numRanks_; i++)
+                for (size_t j = send_disp[i]; j < send_disp[i + 1]; j++)
+                    send_dens[j] = vdataSender[i].send_dens_per_field[0][j - send_disp[i]];
+            MPI_Alltoallv(send_dens.data(), send_count.data(), send_disp.data(), MpiType<T>{},
+                          recv_dens.data(), recv_count.data(), recv_disp.data(), MpiType<T>{}, MPI_COMM_WORLD);
+            for (size_t i = 0; i < totalRecv; i++)
+                currentGrid()[recv_index[i]] += recv_dens[i];
+        }
+        else
+        {
+            std::vector<T> send_packed(totalSend * numFields);
+            std::vector<T> recv_packed(totalRecv * numFields);
+            for (int r = 0; r < numRanks_; r++)
+                for (size_t j = send_disp[r]; j < send_disp[r + 1]; j++)
+                    for (size_t f = 0; f < numFields; f++)
+                        send_packed[j * numFields + f] = vdataSender[r].send_dens_per_field[f][j - send_disp[r]];
+            std::vector<int> send_count_v(numRanks_), send_disp_v(numRanks_ + 1);
+            std::vector<int> recv_count_v(numRanks_), recv_disp_v(numRanks_ + 1);
+            for (int r = 0; r < numRanks_; r++)
+            {
+                send_count_v[r] = send_count[r] * static_cast<int>(numFields);
+                send_disp_v[r + 1] = send_disp[r + 1] * static_cast<int>(numFields);
+                recv_count_v[r] = recv_count[r] * static_cast<int>(numFields);
+                recv_disp_v[r + 1] = recv_disp[r + 1] * static_cast<int>(numFields);
+            }
+            MPI_Alltoallv(send_packed.data(), send_count_v.data(), send_disp_v.data(), MpiType<T>{},
+                          recv_packed.data(), recv_count_v.data(), recv_disp_v.data(), MpiType<T>{}, MPI_COMM_WORLD);
+            for (size_t j = 0; j < totalRecv; j++)
+                for (size_t f = 0; f < numFields; f++)
+                    grid_fields_[f][recv_index[j]] += recv_packed[j * numFields + f];
+        }
         for (int i = 0; i < numRanks_; i++)
         {
             vdataSender[i].send_index.clear();
-            vdataSender[i].send_dens.clear();
+            for (auto& v : vdataSender[i].send_dens_per_field)
+                v.clear();
         }
     }
+
 
     // Map physical position to cell indices (cell that contains the point). Clamp to [0, gridDim_-1].
     std::tuple<int, int, int> positionToCell(T px, T py, T pz) const
@@ -307,6 +423,81 @@ public:
         std::cout << "rank " << rank_ << " rasterize (sph) done" << std::endl;
     }
 
+    // Multi-field: one particle loop, one exchange for all fields.
+    void rasterize_particles_to_mesh_multi(std::vector<KeyType>& keys,
+                                           const std::vector<std::vector<T>*>& field_ptrs, size_t numFields)
+    {
+        std::cout << "rank " << rank_ << " rasterize (nearest_neighbor, " << numFields << " fields) start" << std::endl;
+        resetCommAndDens();
+        const size_t numParticles = keys.size();
+        for (size_t p = 0; p < numParticles; ++p)
+        {
+            auto crd    = calculateKeyIndices(keys[p], gridDim_);
+            int  indexi = std::get<0>(crd), indexj = std::get<1>(crd), indexk = std::get<2>(crd);
+            assert(indexi >= 0 && indexi < gridDim_ && indexj >= 0 && indexj < gridDim_ && indexk >= 0 && indexk < gridDim_);
+            std::vector<T> vals(numFields);
+            for (size_t f = 0; f < numFields; f++)
+                vals[f] = (*field_ptrs[f])[p];
+            assignValuesByMeshCoord(indexi, indexj, indexk, vals.data(), numFields);
+        }
+        performExchangeAndAccumulate(numFields);
+        convertMassToDensityAllFields(numFields);
+        std::cout << "rank " << rank_ << " rasterize (nearest_neighbor, " << numFields << " fields) done" << std::endl;
+    }
+
+    void rasterize_particles_to_mesh_cell_average_multi(std::vector<T>& x, std::vector<T>& y, std::vector<T>& z,
+                                                         const std::vector<std::vector<T>*>& field_ptrs, size_t numFields)
+    {
+        std::cout << "rank " << rank_ << " rasterize (cell_average, " << numFields << " fields) start" << std::endl;
+        resetCommAndDens();
+        for (size_t p = 0; p < x.size(); ++p)
+        {
+            auto [ii, jj, kk] = positionToCell(x[p], y[p], z[p]);
+            std::vector<T> vals(numFields);
+            for (size_t f = 0; f < numFields; f++)
+                vals[f] = (*field_ptrs[f])[p];
+            assignValuesByMeshCoord(ii, jj, kk, vals.data(), numFields);
+        }
+        performExchangeAndAccumulate(numFields);
+        convertMassToDensityAllFields(numFields);
+        std::cout << "rank " << rank_ << " rasterize (cell_average, " << numFields << " fields) done" << std::endl;
+    }
+
+    void rasterize_particles_to_mesh_sph_multi(std::vector<T>& x, std::vector<T>& y, std::vector<T>& z,
+                                               const std::vector<T>& h,
+                                               const std::vector<std::vector<T>*>& field_ptrs, size_t numFields)
+    {
+        std::cout << "rank " << rank_ << " rasterize (sph, " << numFields << " fields) start" << std::endl;
+        resetCommAndDens();
+        T dx = (Lmax_ - Lmin_) / static_cast<T>(gridDim_);
+        for (size_t p = 0; p < x.size(); ++p)
+        {
+            T hp = h[p];
+            if (hp <= T(0)) continue;
+            T xp = x[p], yp = y[p], zp = z[p];
+            int supportCells = static_cast<int>(std::ceil(T(2) * hp / dx)) + 1;
+            auto [i0, j0, k0] = positionToCell(xp, yp, zp);
+            for (int di = -supportCells; di <= supportCells; ++di)
+                for (int dj = -supportCells; dj <= supportCells; ++dj)
+                    for (int dk = -supportCells; dk <= supportCells; ++dk)
+                    {
+                        int i = i0 + di, j = j0 + dj, k = k0 + dk;
+                        if (i < 0 || i >= gridDim_ || j < 0 || j >= gridDim_ || k < 0 || k >= gridDim_) continue;
+                        T cx, cy, cz;
+                        cellCenter(i, j, k, cx, cy, cz);
+                        T r = std::sqrt((xp - cx) * (xp - cx) + (yp - cy) * (yp - cy) + (zp - cz) * (zp - cz));
+                        T w = sphKernel(r, hp);
+                        if (w <= T(0)) continue;
+                        std::vector<T> vals(numFields);
+                        for (size_t f = 0; f < numFields; f++)
+                            vals[f] = (*field_ptrs[f])[p] * w;
+                        assignValuesByMeshCoord(i, j, k, vals.data(), numFields);
+                    }
+        }
+        performExchangeAndAccumulate(numFields);
+        std::cout << "rank " << rank_ << " rasterize (sph, " << numFields << " fields) done" << std::endl;
+    }
+
 private:
     size_t  localSize_{0}; // number of mesh cells on this rank
 
@@ -314,7 +505,8 @@ private:
     {
         // compute this rank's z-slab
         localSize_ = static_cast<size_t>(gridDim_) * static_cast<size_t>(gridDim_) * static_cast<size_t>(gridDim_ / numRanks_);
-        dens_.assign(localSize_, T{0});
+        grid_fields_.resize(1);
+        grid_fields_[0].assign(localSize_, T{0});
         resize_comm_size(numRanks_);
         setCoordinates(Lmin_, Lmax_);
     }
@@ -342,11 +534,14 @@ private:
 #ifdef USE_CUDA
 template<typename T>
 void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>& mesh, std::vector<p2g::KeyType> keys, std::vector<T> x,
-                                      std::vector<T> y, std::vector<T> z, std::vector<T> mass);
+                                      std::vector<T> y, std::vector<T> z, std::vector<T> mass,
+                                      bool doExchange = true, bool doReset = true);
 template<typename T>
 void rasterize_particles_to_mesh_cuda_cell_average(p2g::Mesh<T>& mesh, std::vector<T> x, std::vector<T> y,
-                                                   std::vector<T> z, std::vector<T> mass);
+                                                   std::vector<T> z, std::vector<T> mass,
+                                                   bool doExchange = true, bool doReset = true);
 template<typename T>
 void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, std::vector<T> y, std::vector<T> z,
-                                          const std::vector<T>& h, std::vector<T> mass);
+                                          const std::vector<T>& h, std::vector<T> mass,
+                                          bool doExchange = true, bool doReset = true);
 #endif

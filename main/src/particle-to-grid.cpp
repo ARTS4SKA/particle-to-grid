@@ -25,6 +25,7 @@ void printHelp(char* name, int rank)
         printf("  --rhoCrit <rho>         Critical density for TIPSY mass scaling\n");
         printf("  --gridSize <n>          Mesh dimension (default: 2^ceil(log3(N)))\n");
         printf("  --interpolation <m>     'nearest', 'sph', or 'cell_average' (default: nearest)\n");
+        printf("  --field <name>[,name]   Extra particle fields to rasterize (e.g. temp,vx)\n");
         printf("  -h, --help              This help\n\n");
     }
 }
@@ -37,6 +38,7 @@ bool parseConfig(const ArgParser& parser, int rank, p2g::Config& config)
     config.grid_size       = parser.get("--gridSize", 0);
     config.lbox            = parser.get("--lbox", 0.0);
     config.rho_crit        = parser.get("--rhoCrit", 0.0);
+    config.extra_field_names = parser.getCommaList("--field");
     std::string interpStr  = parser.get("--interpolation", std::string("nearest"));
     try
     {
