@@ -1,10 +1,15 @@
 #pragma once
 
-#include <tuple>
-#include <omp.h>
 #include <chrono>
+#include <ostream>
+#include <tuple>
 
-auto initMpi()
+#include <omp.h>
+#include <mpi.h>
+
+namespace p2g {
+
+inline std::tuple<int, int> initMpi()
 {
     int rank     = 0;
     int numRanks = 0;
@@ -25,7 +30,7 @@ auto initMpi()
     return std::make_tuple(rank, numRanks);
 }
 
-int exitSuccess()
+inline int exitSuccess()
 {
     MPI_Finalize();
     return EXIT_SUCCESS;
@@ -33,30 +38,24 @@ int exitSuccess()
 
 class Timer
 {
-    typedef std::chrono::high_resolution_clock Clock;
-    typedef std::chrono::duration<float>       Time;
+    using Clock = std::chrono::high_resolution_clock;
+    using Time  = std::chrono::duration<float>;
 
 public:
-    Timer(std::ostream& out)
-        : out(out)
-    {
-    }
+    explicit Timer(std::ostream& out) : out(out) {}
 
-    void start()
-    {
-        tstart = tlast = Clock::now();
-    }
+    void start() { tstart = tlast = Clock::now(); }
 
-    //! @brief time elapsed between tstart and now
-    void elapsed(const std::string func) 
+    void elapsed(const std::string& label)
     {
         tlast = Clock::now();
-        out << func << " elapsed time: " << std::chrono::duration_cast<Time>(tlast - tstart).count() << std::endl;
+        out << label << " elapsed time: " << std::chrono::duration_cast<Time>(tlast - tstart).count() << std::endl;
         tstart = tlast;
     }
 
-
 private:
-    std::ostream&                  out;
-    std::chrono::time_point<Clock> tstart, tlast;
+    std::ostream&       out;
+    Clock::time_point   tstart, tlast;
 };
+
+} // namespace p2g

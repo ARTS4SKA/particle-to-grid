@@ -5,15 +5,16 @@ function(enableGpuDirect exename)
 endfunction()
 
 set(exename particle-to-grid)
-add_executable(${exename} particle-to-grid.cpp)
+add_executable(${exename} particle-to-grid.cpp p2g/run.cpp)
 message(STATUS "CSTONE_DIR=${CSTONE_DIR}")
-target_include_directories(${exename} PUBLIC ${CSTONE_DIR} ${PROJECT_SOURCE_DIR}/extern/io ${MPI_CXX_INCLUDE_PATH})
+target_include_directories(${exename} PUBLIC ${PROJECT_SOURCE_DIR}/main/src ${CSTONE_DIR} ${PROJECT_SOURCE_DIR}/extern/io ${MPI_CXX_INCLUDE_PATH})
 target_link_libraries(${exename} PRIVATE io OpenMP::OpenMP_CXX ${MPI_CXX_LIBRARIES})
 install(TARGETS ${exename} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(CMAKE_CUDA_COMPILER)
-    add_executable(${exename}-cuda particle-to-grid.cpp mesh.cu)
+    add_executable(${exename}-cuda particle-to-grid.cpp p2g/run.cpp mesh.cu)
     target_include_directories(${exename}-cuda PUBLIC
+        ${PROJECT_SOURCE_DIR}/main/src
         ${CMAKE_BINARY_DIR}/main/src
         ${CSTONE_DIR}
         ${PROJECT_SOURCE_DIR}/extern/io
