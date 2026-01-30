@@ -44,18 +44,31 @@ class Timer
 public:
     explicit Timer(std::ostream& out) : out(out) {}
 
-    void start() { tstart = tlast = Clock::now(); }
+    void start()
+    {
+        tstart = tlast = Clock::now();
+        t0 = tstart;
+    }
 
-    void elapsed(const std::string& label)
+    /** Returns elapsed seconds since last start() or elapsed() call, and prints to stream. */
+    float elapsed(const std::string& label)
     {
         tlast = Clock::now();
-        out << label << " elapsed time: " << std::chrono::duration_cast<Time>(tlast - tstart).count() << std::endl;
+        float sec = std::chrono::duration_cast<Time>(tlast - tstart).count();
+        out << label << " elapsed time: " << sec << " s" << std::endl;
         tstart = tlast;
+        return sec;
+    }
+
+    /** Returns total seconds since first start(). */
+    float totalElapsed() const
+    {
+        return std::chrono::duration_cast<Time>(Clock::now() - t0).count();
     }
 
 private:
-    std::ostream&       out;
-    Clock::time_point   tstart, tlast;
+    std::ostream&     out;
+    Clock::time_point t0, tstart, tlast;
 };
 
 } // namespace p2g

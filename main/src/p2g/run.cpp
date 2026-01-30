@@ -132,7 +132,12 @@ bool run(Config const& config, int rank, int numRanks)
     }
 
     size_t numParticles = reader->globalNumParticles();
-    if (rank == 0) std::cout << "Total number of particles: " << numParticles << std::endl;
+    if (rank == 0)
+    {
+        std::cout << "Configuration: checkpoint_type=" << typeLower
+                  << " interpolation=" << to_string(config.interpolation) << std::endl;
+        std::cout << "Total number of particles: " << numParticles << std::endl;
+    }
     size_t simDim = std::cbrt(numParticles);
 
     const size_t localNum = reader->localNumParticles();
@@ -203,7 +208,7 @@ bool run(Config const& config, int rank, int numRanks)
         }
     }
 
-    timer.elapsed("Checkpoint read");
+    float t_read = timer.elapsed("Checkpoint read");
     std::cout << "Read " << reader->localNumParticles() << " particles on rank " << rank << std::endl;
 
     int gridDim = (config.grid_size > 0)
@@ -238,7 +243,7 @@ bool run(Config const& config, int rank, int numRanks)
     scratch1.clear();
     scratch2.clear();
     scratch3.clear();
-    timer.elapsed("Sync");
+    float t_sync = timer.elapsed("Sync");
 
     std::vector<std::vector<T>*> extraFieldPtrs;
     for (size_t i = 0; i < numExtra; ++i)
@@ -246,8 +251,9 @@ bool run(Config const& config, int rank, int numRanks)
     rasterize_dispatch(mesh, config.interpolation, keys, x, y, z, h, mass, extraFieldPtrs);
 
     std::cout << "rasterized" << std::endl;
-    timer.elapsed("Rasterization");
+    float t_raster = timer.elapsed("Rasterization");
 
+    float t_write = 0.f;
     if (rank == 0)
     {
         const size_t numFields = mesh.numFields();
@@ -260,6 +266,17 @@ bool run(Config const& config, int rank, int numRanks)
             file.close();
             std::cout << "Saved " << (f == 0 ? "density" : config.extra_field_names[f - 1]) << " to " << fname << std::endl;
         }
+        t_write = timer.elapsed("Output write");
+    }
+
+    if (rank == 0)
+    {
+        float total = timer.totalElapsed();
+        std::cout << "Timing summary: checkpoint_type=" << typeLower
+                  << " interpolation=" << to_string(config.interpolation)
+                  << " | read=" << std::fixed << std::setprecision(4) << t_read
+                  << " s sync=" << t_sync << " s rasterize=" << t_raster
+                  << " s write=" << t_write << " s total=" << total << " s" << std::endl;
     }
 
     return true;
