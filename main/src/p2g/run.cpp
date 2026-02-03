@@ -161,7 +161,7 @@ bool run(Config const& config, int rank, int numRanks)
     catch (...) {}
     try
     {
-        reader->readField("mass", mass.data());
+        reader->readField("m", mass.data());
     }
     catch (...)
     {
