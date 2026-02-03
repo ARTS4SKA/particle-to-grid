@@ -146,7 +146,9 @@ __device__ T sphKernelDevice(T r, T h)
 }
 
 // SPH: each particle contributes to all cells within 2h. Remote list can be large.
-constexpr int MAX_SPH_REMOTE_PER_PARTICLE = 128;
+// Cap per-particle and total to avoid GPU OOM; overflow is reported and contributions are truncated.
+constexpr int  MAX_SPH_REMOTE_PER_PARTICLE = 64;
+constexpr size_t MAX_SPH_REMOTE_TOTAL       = 16 * 1024 * 1024;  // 16M entries max (~320 MB)
 
 template<class T>
 __global__ void classifyAndRasterizeSphKernel(const T* x, const T* y, const T* z, const T* h, const T* mass,
@@ -489,7 +491,8 @@ void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, 
     int      base      = gridDim / mesh.numRanks_;
     uint64_t localSize = static_cast<uint64_t>(gridDim) * gridDim * base;
     T        dx        = (mesh.Lmax_ - mesh.Lmin_) / static_cast<T>(gridDim);
-    int      maxRemote = numParticles * MAX_SPH_REMOTE_PER_PARTICLE;
+    size_t   maxRemote = std::min(static_cast<size_t>(numParticles) * MAX_SPH_REMOTE_PER_PARTICLE, MAX_SPH_REMOTE_TOTAL);
+    int      maxRemoteEntries = static_cast<int>(maxRemote);
 
     if (mesh.send_count.size() != static_cast<size_t>(mesh.numRanks_)) mesh.resize_comm_size(mesh.numRanks_);
     if (doReset) mesh.resetCommAndDens();
@@ -532,15 +535,15 @@ void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, 
     int blocksPerGrid   = (numParticles + threadsPerBlock - 1) / threadsPerBlock;
     classifyAndRasterizeSphKernel<<<blocksPerGrid, threadsPerBlock>>>(
         d_x, d_y, d_z, d_h, d_mass, numParticles, gridDim, mesh.numRanks_, mesh.rank_,
-        mesh.Lmin_, dx, d_dens, d_remoteRanks, d_remoteIndices, d_remoteMass, d_remoteCount, maxRemote);
+        mesh.Lmin_, dx, d_dens, d_remoteRanks, d_remoteIndices, d_remoteMass, d_remoteCount, maxRemoteEntries);
     checkCudaError(cudaDeviceSynchronize(), "sph kernel");
 
     checkCudaError(cudaMemcpy(mesh.currentGridData(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost), "dens back");
     int h_remoteCount = 0;
     checkCudaError(cudaMemcpy(&h_remoteCount, d_remoteCount, sizeof(int), cudaMemcpyDeviceToHost), "remote count back");
-    if (h_remoteCount > maxRemote && mesh.rank_ == 0)
-        std::cerr << "SPH remote contributions overflow (got " << h_remoteCount << ", max " << maxRemote << "). Results may be incomplete." << std::endl;
-    int copyCount = std::min(h_remoteCount, maxRemote);
+    if (h_remoteCount > maxRemoteEntries && mesh.rank_ == 0)
+        std::cerr << "SPH remote contributions overflow (got " << h_remoteCount << ", max " << maxRemoteEntries << "). Results may be incomplete." << std::endl;
+    int copyCount = std::min(h_remoteCount, maxRemoteEntries);
 
     if (copyCount > 0)
     {
