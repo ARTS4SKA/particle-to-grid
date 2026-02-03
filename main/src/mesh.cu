@@ -14,6 +14,17 @@ void checkCudaError(cudaError_t err, const char* msg)
     }
 }
 
+// Z-slab decomposition: rank r owns k in [r*base, (r+1)*base). Local grid is (gridDim x gridDim x base).
+// Returns the local index on the rank that owns global (i,j,k).
+__device__ __host__ inline uint64_t globalToLocalIndexZSlab(int i, int j, int k, int gridDim, int numRanks)
+{
+    int base       = gridDim / numRanks;
+    int targetRank = k / base;
+    if (targetRank >= numRanks) targetRank = numRanks - 1;
+    int localK     = k - targetRank * base;
+    return static_cast<uint64_t>(i) + static_cast<uint64_t>(j) * gridDim + static_cast<uint64_t>(localK) * gridDim * gridDim;
+}
+
 // Kernel: classify particles as local or remote, and accumulate local contributions
 template<class T>
 __global__ void classifyAndRasterizeKernel(const KeyType* keys,
@@ -43,48 +54,36 @@ __global__ void classifyAndRasterizeKernel(const KeyType* keys,
 
     if (i < 0 || i >= gridDim || j < 0 || j >= gridDim || k < 0 || k >= gridDim) return;
 
-    // Calculate target rank (1D slab decomposition along z)
-    int targetRank = k / (gridDim / numRanks);
+    int base       = gridDim / numRanks;
+    int targetRank = k / base;
     if (targetRank >= numRanks) targetRank = numRanks - 1;
+    uint64_t localIndex = globalToLocalIndexZSlab(i, j, k, gridDim, numRanks);
 
     if (targetRank == rank)
-    {
-        // Local particle: calculate local index and accumulate directly
-        int base = gridDim / numRanks;
-        int remI = i % base;
-        int remJ = j % base;
-        int remK = k % base;
-        uint64_t localIndex = remI + remJ * base + remK * base * base;
-        
         atomicAdd(&dens[localIndex], mass[idx]);
-    }
     else
     {
-        // Remote particle: add to remote list
-        int base = gridDim / numRanks;
-        int remI = i % base;
-        int remJ = j % base;
-        int remK = k % base;
-        uint64_t localIndex = remI + remJ * base + remK * base * base;
-        
         int pos = atomicAdd(remoteCount, 1);
-        remoteRanks[pos] = targetRank;
-        remoteIndices[pos] = localIndex;
-        remoteMass[pos] = mass[idx];
+        remoteRanks[pos]   = targetRank;
+        remoteIndices[pos]  = localIndex;
+        remoteMass[pos]     = mass[idx];
     }
 }
 
-// Kernel: accumulate received contributions into density field
+// Kernel: accumulate received contributions into density field (indices are z-slab local)
 template<class T>
 __global__ void accumulateReceivedKernel(const uint64_t* indices,
                                          const T*        mass,
                                          int             count,
+                                         uint64_t        localSize,
                                          T*              dens)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
-    atomicAdd(&dens[indices[idx]], mass[idx]);
+    uint64_t pos = indices[idx];
+    if (pos < localSize)
+        atomicAdd(&dens[pos], mass[idx]);
 }
 
 // Device helper: position to cell indices (clamped)
@@ -117,18 +116,16 @@ __global__ void classifyAndRasterizeCellAverageKernel(const T* x, const T* y, co
     int base       = gridDim / numRanks;
     int targetRank = k / base;
     if (targetRank >= numRanks) targetRank = numRanks - 1;
-
-    int remI = i % base, remJ = j % base, remK = k % base;
-    uint64_t localIndex = remI + remJ * base + remK * base * base;
+    uint64_t localIndex = globalToLocalIndexZSlab(i, j, k, gridDim, numRanks);
 
     if (targetRank == rank)
         atomicAdd(&dens[localIndex], mass[idx]);
     else
     {
         int pos = atomicAdd(remoteCount, 1);
-        remoteRanks[pos]  = targetRank;
-        remoteIndices[pos] = localIndex;
-        remoteMass[pos]   = mass[idx];
+        remoteRanks[pos]   = targetRank;
+        remoteIndices[pos]  = localIndex;
+        remoteMass[pos]     = mass[idx];
     }
 }
 
@@ -188,8 +185,7 @@ __global__ void classifyAndRasterizeSphKernel(const T* x, const T* y, const T* z
                 T contrib = mass[idx] * w;
                 int targetRank = k / base;
                 if (targetRank >= numRanks) targetRank = numRanks - 1;
-                int remI = i % base, remJ = j % base, remK = k % base;
-                uint64_t localIndex = remI + remJ * base + remK * base * base;
+                uint64_t localIndex = globalToLocalIndexZSlab(i, j, k, gridDim, numRanks);
 
                 if (targetRank == rank)
                     atomicAdd(&dens[localIndex], contrib);
@@ -199,7 +195,7 @@ __global__ void classifyAndRasterizeSphKernel(const T* x, const T* y, const T* z
                     if (pos < maxRemoteEntries)
                     {
                         remoteRanks[pos]   = targetRank;
-                        remoteIndices[pos] = localIndex;
+                        remoteIndices[pos]  = localIndex;
                         remoteMass[pos]    = contrib;
                     }
                 }
@@ -357,7 +353,7 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
             checkCudaError(cudaMemcpy(d_recvMass, mesh.recv_dens.data(), mesh.recv_disp[mesh.numRanks_] * sizeof(T), cudaMemcpyHostToDevice), "");
             checkCudaError(cudaMemcpy(d_dens, mesh.currentGridData(), localSize * sizeof(T), cudaMemcpyHostToDevice), "");
             int recvBlocks = (mesh.recv_disp[mesh.numRanks_] + threadsPerBlock - 1) / threadsPerBlock;
-            accumulateReceivedKernel<<<recvBlocks, threadsPerBlock>>>(d_recvIndices, d_recvMass, mesh.recv_disp[mesh.numRanks_], d_dens);
+            accumulateReceivedKernel<<<recvBlocks, threadsPerBlock>>>(d_recvIndices, d_recvMass, mesh.recv_disp[mesh.numRanks_], localSize, d_dens);
             checkCudaError(cudaDeviceSynchronize(), "accumulateReceivedKernel");
             checkCudaError(cudaMemcpy(mesh.currentGridData(), d_dens, localSize * sizeof(T), cudaMemcpyDeviceToHost), "");
             cudaFree(d_recvIndices);

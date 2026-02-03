@@ -190,18 +190,15 @@ public:
         return k / (gridDim_ / numRanks_);
     }
 
-    inline int calculateInboxIndexFromMeshCoord(int i, int j, int k)
+    // Z-slab: rank r owns k in [r*base, (r+1)*base). Local grid (gridDim x gridDim x base); row-major index.
+    inline uint64_t calculateInboxIndexFromMeshCoord(int i, int j, int k)
     {
-        int base = gridDim_ / numRanks_;
-        int remI = i % base;
-        int remJ = j % base;
-        int remK = k % base;
-
-        int index = remI + remJ * base + remK * base * base;
-        // index out of bounds check
-        if (index >= gridDim_ * gridDim_ * base)
+        int base   = gridDim_ / numRanks_;
+        int localK = k - (k / base) * base;  // k % base for positive k
+        uint64_t index = static_cast<uint64_t>(i) + static_cast<uint64_t>(j) * gridDim_ + static_cast<uint64_t>(localK) * gridDim_ * gridDim_;
+        if (index >= localSize_)
         {
-            std::cerr << "rank " << rank_ << " ERROR: index = " << index << " is out of range" << std::endl;
+            std::cerr << "rank " << rank_ << " ERROR: index = " << index << " >= localSize " << localSize_ << std::endl;
             return 0;
         }
         return index;
