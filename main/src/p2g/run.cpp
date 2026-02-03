@@ -214,6 +214,13 @@ bool run(Config const& config, int rank, int numRanks)
     int gridDim = (config.grid_size > 0)
                       ? config.grid_size
                       : static_cast<int>(std::pow(2, std::ceil(std::log(simDim) / std::log(2))));
+    if (gridDim < numRanks)
+    {
+        if (rank == 0)
+            std::cerr << "gridSize " << gridDim << " < numRanks " << numRanks
+                      << "; using gridDim = numRanks (each rank needs at least one z-slab)." << std::endl;
+        gridDim = numRanks;
+    }
     double meshLmin = (config.lbox > 0.0 && typeLower == "tipsy") ? 0.0 : -0.5;
     double meshLmax = (config.lbox > 0.0 && typeLower == "tipsy") ? config.lbox : 0.5;
 

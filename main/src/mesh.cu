@@ -302,12 +302,16 @@ void rasterize_particles_to_mesh_cuda(p2g::Mesh<T>&   mesh,
         checkCudaError(cudaMemcpy(h_remoteMass.data(), d_remoteMass, h_remoteCount * sizeof(T), cudaMemcpyDeviceToHost),
                        "Copying remote mass to host");
 
-        // Organize remote data by rank
+        // Organize remote data by rank. Multi-field: only update send_count/send_index on first field (doReset);
+        // subsequent fields only append to send_dens_per_field so indices stay in 1:1 correspondence.
         for (int i = 0; i < h_remoteCount; i++)
         {
             int targetRank = h_remoteRanks[i];
-            mesh.send_count[targetRank]++;
-            mesh.vdataSender[targetRank].send_index.push_back(h_remoteIndices[i]);
+            if (doExchange || doReset)
+            {
+                mesh.send_count[targetRank]++;
+                mesh.vdataSender[targetRank].send_index.push_back(h_remoteIndices[i]);
+            }
             mesh.vdataSender[targetRank].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
         }
     }
@@ -450,9 +454,13 @@ void rasterize_particles_to_mesh_cuda_cell_average(p2g::Mesh<T>& mesh, std::vect
         checkCudaError(cudaMemcpy(h_remoteMass.data(), d_remoteMass, h_remoteCount * sizeof(T), cudaMemcpyDeviceToHost), "");
         for (int i = 0; i < h_remoteCount; i++)
         {
-            mesh.send_count[h_remoteRanks[i]]++;
-            mesh.vdataSender[h_remoteRanks[i]].send_index.push_back(h_remoteIndices[i]);
-            mesh.vdataSender[h_remoteRanks[i]].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
+            int targetRank = h_remoteRanks[i];
+            if (doExchange || doReset)
+            {
+                mesh.send_count[targetRank]++;
+                mesh.vdataSender[targetRank].send_index.push_back(h_remoteIndices[i]);
+            }
+            mesh.vdataSender[targetRank].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
         }
     }
 
@@ -544,9 +552,13 @@ void rasterize_particles_to_mesh_cuda_sph(p2g::Mesh<T>& mesh, std::vector<T> x, 
         checkCudaError(cudaMemcpy(h_remoteMass.data(), d_remoteMass, copyCount * sizeof(T), cudaMemcpyDeviceToHost), "");
         for (int i = 0; i < copyCount; i++)
         {
-            mesh.send_count[h_remoteRanks[i]]++;
-            mesh.vdataSender[h_remoteRanks[i]].send_index.push_back(h_remoteIndices[i]);
-            mesh.vdataSender[h_remoteRanks[i]].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
+            int targetRank = h_remoteRanks[i];
+            if (doExchange || doReset)
+            {
+                mesh.send_count[targetRank]++;
+                mesh.vdataSender[targetRank].send_index.push_back(h_remoteIndices[i]);
+            }
+            mesh.vdataSender[targetRank].send_dens_per_field[mesh.current_field_index_].push_back(h_remoteMass[i]);
         }
     }
 
