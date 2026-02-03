@@ -261,7 +261,7 @@ bool run(Config const& config, int rank, int numRanks)
     float t_raster = timer.elapsed("Rasterization");
 
     float t_write = 0.f;
-    if (rank == 0)
+    if (rank == 0 && config.write_output)
     {
         const size_t numFields = mesh.numFields();
         for (size_t f = 0; f < numFields; ++f)

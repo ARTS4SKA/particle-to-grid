@@ -17,6 +17,7 @@ struct Config
     double                       rho_crit        = 0.0;
     InterpolationMethod          interpolation   = InterpolationMethod::NearestNeighbor;
     std::vector<std::string>     extra_field_names;  // e.g. {"temp", "vx"} for additional quantities to rasterize
+    bool                         write_output   = true;  // if false, skip writing density/field .txt files
 };
 
 /** Validates config. On failure, sets errMsg (on rank 0) and returns false. */

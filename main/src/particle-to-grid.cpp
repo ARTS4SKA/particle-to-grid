@@ -26,6 +26,7 @@ void printHelp(char* name, int rank)
         printf("  --gridSize <n>          Mesh dimension (default: 2^ceil(log3(N)))\n");
         printf("  --interpolation <m>     'nearest', 'sph', or 'cell_average' (default: nearest)\n");
         printf("  --field <name>[,name]   Extra particle fields to rasterize (e.g. temp,vx)\n");
+        printf("  --no-output             Do not write density/field .txt files\n");
         printf("  -h, --help              This help\n\n");
     }
 }
@@ -39,6 +40,7 @@ bool parseConfig(const ArgParser& parser, int rank, p2g::Config& config)
     config.lbox            = parser.get("--lbox", 0.0);
     config.rho_crit        = parser.get("--rhoCrit", 0.0);
     config.extra_field_names = parser.getCommaList("--field");
+    config.write_output      = !parser.exists("--no-output");
     std::string interpStr  = parser.get("--interpolation", std::string("nearest"));
     try
     {
