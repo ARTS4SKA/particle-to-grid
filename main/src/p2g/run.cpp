@@ -5,6 +5,10 @@
 #include "ifile_io_impl.h"
 #include "cstone/domain/domain.hpp"
 
+#ifdef SPH_EXA_HAVE_H5PART
+#include "h5part_wrapper.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -261,19 +265,72 @@ bool run(Config const& config, int rank, int numRanks)
     float t_raster = timer.elapsed("Rasterization");
 
     float t_write = 0.f;
-    if (rank == 0 && config.write_output)
+    if (config.write_output)
     {
         const size_t numFields = mesh.numFields();
-        for (size_t f = 0; f < numFields; ++f)
+
+        if (config.output_format == OutputFormat::Text)
         {
-            std::string fname = (f == 0) ? "density.txt" : config.extra_field_names[f - 1] + ".txt";
-            std::ofstream file(fname);
-            for (size_t i = 0; i < mesh.grid_fields_[f].size(); ++i)
-                file << i << " " << std::scientific << mesh.grid_fields_[f][i] << "\n";
-            file.close();
-            std::cout << "Saved " << (f == 0 ? "density" : config.extra_field_names[f - 1]) << " to " << fname << std::endl;
+            // Text output: rank 0 gathers full grid (or writes local only for single rank)
+            if (rank == 0)
+            {
+                for (size_t f = 0; f < numFields; ++f)
+                {
+                    std::string fname = (f == 0)
+                        ? config.output_path + ".txt"
+                        : config.extra_field_names[f - 1] + ".txt";
+                    std::ofstream file(fname);
+                    for (size_t i = 0; i < mesh.grid_fields_[f].size(); ++i)
+                        file << i << " " << std::scientific << mesh.grid_fields_[f][i] << "\n";
+                    file.close();
+                    std::cout << "Saved " << (f == 0 ? "density" : config.extra_field_names[f - 1])
+                              << " to " << fname << std::endl;
+                }
+            }
+            t_write = timer.elapsed("Output write");
         }
-        t_write = timer.elapsed("Output write");
+        else // HDF5 output: all ranks write in parallel
+        {
+#ifdef SPH_EXA_HAVE_H5PART
+            std::string h5path = config.output_path + ".h5";
+            int64_t mode = H5PART_WRITE | H5PART_VFD_MPIIO_IND;
+            H5PartFile* h5File = fileutils::openH5Part(h5path, mode, MPI_COMM_WORLD);
+            if (!h5File)
+                throw std::runtime_error("Failed to open HDF5 output file: " + h5path);
+
+            // Set step 0
+            H5PartSetStep(h5File, 0);
+
+            // Each rank writes its local portion (z-slab): localSize cells
+            uint64_t localSize = mesh.grid_fields_[0].size();
+            H5PartSetNumParticles(h5File, static_cast<h5part_int64_t>(localSize));
+
+            // Write grid metadata as step attributes
+            int gridDimAttr = mesh.gridDim_;
+            int numRanksAttr = numRanks;
+            fileutils::writeH5PartStepAttrib(h5File, "gridDim", &gridDimAttr, 1);
+            fileutils::writeH5PartStepAttrib(h5File, "numRanks", &numRanksAttr, 1);
+            double lminAttr = mesh.Lmin_, lmaxAttr = mesh.Lmax_;
+            fileutils::writeH5PartStepAttrib(h5File, "Lmin", &lminAttr, 1);
+            fileutils::writeH5PartStepAttrib(h5File, "Lmax", &lmaxAttr, 1);
+
+            // Write each field
+            for (size_t f = 0; f < numFields; ++f)
+            {
+                std::string fieldName = (f == 0) ? "density" : config.extra_field_names[f - 1];
+                fileutils::writeH5PartField(h5File, fieldName, mesh.grid_fields_[f].data());
+            }
+
+            H5PartCloseFile(h5File);
+            MPI_Barrier(MPI_COMM_WORLD);  // ensure all ranks finish writing before timing
+            t_write = timer.elapsed("Output write");
+            if (rank == 0)
+                std::cout << "Saved " << numFields << " field(s) to " << h5path << " (parallel HDF5)" << std::endl;
+#else
+            if (rank == 0)
+                std::cerr << "HDF5 output requested but H5Part support not compiled in. Use --output-format text.\n";
+#endif
+        }
     }
 
     if (rank == 0)
@@ -281,6 +338,7 @@ bool run(Config const& config, int rank, int numRanks)
         float total = timer.totalElapsed();
         std::cout << "Timing summary: checkpoint_type=" << typeLower
                   << " interpolation=" << to_string(config.interpolation)
+                  << " output=" << to_string(config.output_format)
                   << " | read=" << std::fixed << std::setprecision(4) << t_read
                   << " s sync=" << t_sync << " s rasterize=" << t_raster
                   << " s write=" << t_write << " s total=" << total << " s" << std::endl;

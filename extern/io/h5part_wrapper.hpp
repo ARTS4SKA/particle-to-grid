@@ -46,7 +46,7 @@ namespace fileutils
 
 using H5PartTypes = util::TypeList<double, float, char, int, int64_t, unsigned, uint64_t>;
 
-std::string H5PartTypeToString(h5part_int64_t type)
+inline std::string H5PartTypeToString(h5part_int64_t type)
 {
     if (type == H5PART_FLOAT64) { return "C++: double / python: np.float64"; }
     if (type == H5PART_FLOAT32) { return "C++: float / python: np.float32"; }
@@ -105,7 +105,7 @@ struct H5PartType<uint64_t>
 };
 
 //! @brief return the names of all datasets in @p h5_file
-std::vector<std::string> datasetNames(H5PartFile* h5_file)
+inline std::vector<std::string> datasetNames(H5PartFile* h5_file)
 {
     auto numSets = H5PartGetNumDatasets(h5_file);
 
@@ -122,7 +122,7 @@ std::vector<std::string> datasetNames(H5PartFile* h5_file)
 }
 
 //! @brief return the names of all file attributes in @p h5_file
-std::vector<std::string> fileAttributeNames(H5PartFile* h5_file)
+inline std::vector<std::string> fileAttributeNames(H5PartFile* h5_file)
 {
     auto numAttributes = H5PartGetNumFileAttribs(h5_file);
 
@@ -141,7 +141,7 @@ std::vector<std::string> fileAttributeNames(H5PartFile* h5_file)
 }
 
 //! @brief return the names of all step attributes in @p h5_file
-std::vector<std::string> stepAttributeNames(H5PartFile* h5_file)
+inline std::vector<std::string> stepAttributeNames(H5PartFile* h5_file)
 {
     auto numAttributes = H5PartGetNumStepAttribs(h5_file);
 
@@ -320,7 +320,7 @@ inline h5part_int64_t writeH5PartField(H5PartFile* h5_file, const std::string& f
 }
 
 //! @brief Open in parallel mode if supported, otherwise serial if numRanks == 1
-H5PartFile* openH5Part(const std::string& path, h5part_int64_t mode, MPI_Comm comm)
+inline H5PartFile* openH5Part(const std::string& path, h5part_int64_t mode, MPI_Comm comm)
 {
     const char* h5_fname = path.c_str();
     H5PartFile* h5_file  = nullptr;

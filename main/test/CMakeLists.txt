@@ -36,3 +36,6 @@ function(addFileIoTest source exename testname ranks)
     particleToGrid_add_test(${testname} EXECUTABLE ${exename} RANKS ${ranks})
 endfunction()
 addFileIoTest(file_io_tests.cpp file_io_mpi FileIOTest 1)
+
+# HDF5 output test with multiple ranks (for parallel write/read validation)
+addFileIoTest(file_io_tests.cpp file_io_mpi_multi FileIOTestMultiRank 4)

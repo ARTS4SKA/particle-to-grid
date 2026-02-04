@@ -26,7 +26,9 @@ void printHelp(char* name, int rank)
         printf("  --gridSize <n>          Mesh dimension (default: 2^ceil(log3(N)))\n");
         printf("  --interpolation <m>     'nearest', 'sph', or 'cell_average' (default: nearest)\n");
         printf("  --field <name>[,name]   Extra particle fields to rasterize (e.g. temp,vx)\n");
-        printf("  --no-output             Do not write density/field .txt files\n");
+        printf("  --output-format <fmt>   'text' (default) or 'hdf5'\n");
+        printf("  --output <path>         Output base name (default: 'density'); ext added automatically\n");
+        printf("  --no-output             Do not write output files\n");
         printf("  -h, --help              This help\n\n");
     }
 }
@@ -41,10 +43,13 @@ bool parseConfig(const ArgParser& parser, int rank, p2g::Config& config)
     config.rho_crit        = parser.get("--rhoCrit", 0.0);
     config.extra_field_names = parser.getCommaList("--field");
     config.write_output      = !parser.exists("--no-output");
-    std::string interpStr  = parser.get("--interpolation", std::string("nearest"));
+    config.output_path       = parser.get("--output", std::string("density"));
+    std::string interpStr    = parser.get("--interpolation", std::string("nearest"));
+    std::string outputFmtStr = parser.get("--output-format", std::string("text"));
     try
     {
-        config.interpolation = p2g::parseInterpolationMethod(interpStr);
+        config.interpolation  = p2g::parseInterpolationMethod(interpStr);
+        config.output_format  = p2g::parseOutputFormat(outputFmtStr);
     }
     catch (const std::exception& e)
     {
