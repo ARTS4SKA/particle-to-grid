@@ -7,7 +7,8 @@ function(enableH5Part exename)
 
         # necessary because the HDF5_INCLUDE_DIRS is empty on CRAY and HIP-compilation is done without the cray-wrapper
         target_include_directories(${exename} PUBLIC $ENV{HDF5_DIR}/include)
-        target_link_libraries(${exename} PRIVATE H5Part ${HDF5_LIBRARIES})
+        # PUBLIC linkage so HDF5 include directories propagate to consumers
+        target_link_libraries(${exename} PUBLIC H5Part ${HDF5_LIBRARIES})
     endif()
 endfunction()
 
