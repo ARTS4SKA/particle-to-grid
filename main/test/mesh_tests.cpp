@@ -1,6 +1,18 @@
 #include <mpi.h>
 #include "gtest/gtest.h"
 #include "mesh.hpp"
+#include "cstone/sfc/hilbert.hpp"
+
+namespace {
+p2g::KeyType cellToKey(int ci, int cj, int ck, int gridDim)
+{
+    unsigned divisor = 1 + static_cast<unsigned>(std::pow(2, 21)) / gridDim;
+    unsigned px = static_cast<unsigned>(ci) * divisor + divisor / 2;
+    unsigned py = static_cast<unsigned>(cj) * divisor + divisor / 2;
+    unsigned pz = static_cast<unsigned>(ck) * divisor + divisor / 2;
+    return cstone::iHilbert<p2g::KeyType>(px, py, pz);
+}
+} // namespace
 
 TEST(meshTest, testMeshInit)
 {
@@ -48,11 +60,10 @@ TEST(meshTest, testEnsureNumFields)
     mesh.ensureNumFields(3);
     EXPECT_EQ(mesh.numFields(), 3u);
     EXPECT_EQ(mesh.grid_fields_.size(), 3u);
-    size_t localSize = static_cast<size_t>(gridSize) * gridSize * gridSize;
+    // Each rank owns gridSize^2 * (gridSize/numRanks) cells (z-slab)
+    size_t localSize = static_cast<size_t>(gridSize) * gridSize * (gridSize / numRanks);
     for (size_t f = 0; f < 3; ++f)
-    {
         EXPECT_EQ(mesh.grid_fields_[f].size(), localSize);
-    }
 }
 
 TEST(meshTest, testSetOutputFieldIndex)
@@ -106,18 +117,56 @@ TEST(meshTest, testRasterizeMultiCellAverageTwoFields)
 
     p2g::Mesh<double> mesh(rank, numRanks, 4, 0.0, 1.0);
     mesh.ensureNumFields(2);
-    // One particle at (0.125, 0.125, 0.125) -> cell (0,0,0), on rank 0
-    std::vector<double> x = {0.125}, y = {0.125}, z = {0.125};
+    // One particle in cell (0,0,0)
+    std::vector<p2g::KeyType> keys = { cellToKey(0, 0, 0, 4) };
     std::vector<double> mass = {6.0};
     std::vector<double> temp = {3.0};
     std::vector<std::vector<double>*> field_ptrs = {&mass, &temp};
 
-    mesh.rasterize_particles_to_mesh_cell_average_multi(x, y, z, field_ptrs, 2);
+    mesh.rasterize_particles_to_mesh_cell_average_multi(keys, field_ptrs, 2);
 
-    double cellVolume = 0.25 * 0.25 * 0.25;
+    // One particle → average = value / 1
     if (rank == 0)
     {
-        EXPECT_NEAR(mesh.grid_fields_[0][0], 6.0 / cellVolume, 1e-10);
-        EXPECT_NEAR(mesh.grid_fields_[1][0], 3.0 / cellVolume, 1e-10);
+        EXPECT_NEAR(mesh.grid_fields_[0][0], 6.0, 1e-10);
+        EXPECT_NEAR(mesh.grid_fields_[1][0], 3.0, 1e-10);
     }
+}
+
+// Verify that calculateKeyIndices(cellToKey(i,j,k)) == (i,j,k) for every cell.
+TEST(meshTest, testCalculateKeyIndicesRoundTrip)
+{
+    int rank = 0, numRanks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
+
+    const int gridDim = 8;
+    p2g::Mesh<double> mesh(rank, numRanks, gridDim, 0.0, 1.0);
+
+    for (int i = 0; i < gridDim; ++i)
+        for (int j = 0; j < gridDim; ++j)
+            for (int k = 0; k < gridDim; ++k)
+            {
+                auto key = cellToKey(i, j, k, gridDim);
+                auto [ri, rj, rk] = mesh.calculateKeyIndices(key, gridDim);
+                EXPECT_EQ(ri, i) << "round-trip failed at i=" << i << " j=" << j << " k=" << k;
+                EXPECT_EQ(rj, j);
+                EXPECT_EQ(rk, k);
+            }
+}
+
+// When gridDim is not divisible by numRanks the last cell(s) must clamp to the last rank.
+TEST(meshTest, testCalculateRankFromMeshCoordClamp)
+{
+    // gridDim=7, numRanks=3 → base=2; k=6 would naively give rank 3 (out-of-bounds).
+    p2g::Mesh<double> mesh(0, 3, 7, 0.0, 1.0);
+
+    EXPECT_EQ(mesh.calculateRankFromMeshCoord(0), 0);
+    EXPECT_EQ(mesh.calculateRankFromMeshCoord(1), 0);
+    EXPECT_EQ(mesh.calculateRankFromMeshCoord(2), 1);
+    EXPECT_EQ(mesh.calculateRankFromMeshCoord(3), 1);
+    EXPECT_EQ(mesh.calculateRankFromMeshCoord(4), 2);
+    EXPECT_EQ(mesh.calculateRankFromMeshCoord(5), 2);
+    // k=6 must clamp to rank 2 (numRanks-1), not 3
+    EXPECT_EQ(mesh.calculateRankFromMeshCoord(6), 2);
 }

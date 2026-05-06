@@ -74,13 +74,13 @@ int main(int argc, char** argv)
 
     p2g::Config config;
     if (!parseConfig(parser, rank, config))
-        return p2g::exitSuccess();
+        return p2g::exitFailure();
 
     std::string errMsg;
     if (!p2g::validate(config, rank, errMsg))
     {
         if (rank == 0 && !errMsg.empty()) std::cerr << errMsg << std::endl;
-        return p2g::exitSuccess();
+        return p2g::exitFailure();
     }
 
     try

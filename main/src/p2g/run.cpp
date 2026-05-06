@@ -42,9 +42,9 @@ void rasterize_single(Mesh<T>& mesh, InterpolationMethod method,
     else if (method == InterpolationMethod::CellAverage)
     {
 #ifdef USE_CUDA
-        rasterize_particles_to_mesh_cuda_cell_average(mesh, x, y, z, values);
+        rasterize_particles_to_mesh_cuda_cell_average(mesh, keys, values);
 #else
-        mesh.rasterize_particles_to_mesh_cell_average(x, y, z, values);
+        mesh.rasterize_particles_to_mesh_cell_average(keys, values);
 #endif
     }
     else
@@ -83,31 +83,48 @@ void rasterize_dispatch(Mesh<T>& mesh, InterpolationMethod method,
         return;
     }
 
-    // Multi-field: one particle loop, one MPI exchange for all fields
-#ifdef USE_CUDA
-    auto runCudaStep = [&](size_t fieldIdx, bool doReset) {
-        mesh.setOutputFieldIndex(fieldIdx);
-        if (method == InterpolationMethod::NearestNeighbor)
-            rasterize_particles_to_mesh_cuda(mesh, keys, x, y, z, *field_ptrs[fieldIdx], false, doReset);
-        else if (method == InterpolationMethod::CellAverage)
-            rasterize_particles_to_mesh_cuda_cell_average(mesh, x, y, z, *field_ptrs[fieldIdx], false, doReset);
-        else
-            rasterize_particles_to_mesh_cuda_sph(mesh, x, y, z, h, *field_ptrs[fieldIdx], false, doReset);
-    };
-    runCudaStep(0, true);
-    for (size_t i = 1; i < numFields; ++i)
-        runCudaStep(i, false);
-    mesh.performExchangeAndAccumulate(numFields);
-    if (method != InterpolationMethod::SPH)
-        mesh.convertMassToDensityAllFields(numFields);
-#else
+    // Multi-field path
     if (method == InterpolationMethod::NearestNeighbor)
-        mesh.rasterize_particles_to_mesh_multi(keys, field_ptrs, numFields);
+    {
+        // NN uses min-distance replacement: each field runs independently (same nearest particle wins)
+#ifdef USE_CUDA
+        for (size_t i = 0; i < numFields; ++i)
+        {
+            mesh.setOutputFieldIndex(i);
+            rasterize_particles_to_mesh_cuda(mesh, keys, x, y, z, *field_ptrs[i], true, true);
+        }
+#else
+        mesh.rasterize_particles_to_mesh_multi(keys, x, y, z, field_ptrs, numFields);
+#endif
+    }
     else if (method == InterpolationMethod::CellAverage)
-        mesh.rasterize_particles_to_mesh_cell_average_multi(x, y, z, field_ptrs, numFields);
-    else
+    {
+        // CA uses accumulate+count: each field runs independently on GPU, single pass on CPU
+#ifdef USE_CUDA
+        for (size_t i = 0; i < numFields; ++i)
+        {
+            mesh.setOutputFieldIndex(i);
+            rasterize_particles_to_mesh_cuda_cell_average(mesh, keys, *field_ptrs[i], true, true);
+        }
+#else
+        mesh.rasterize_particles_to_mesh_cell_average_multi(keys, field_ptrs, numFields);
+#endif
+    }
+    else // SPH
+    {
+#ifdef USE_CUDA
+        auto runCudaStep = [&](size_t fieldIdx, bool doReset) {
+            mesh.setOutputFieldIndex(fieldIdx);
+            rasterize_particles_to_mesh_cuda_sph(mesh, x, y, z, h, *field_ptrs[fieldIdx], false, doReset);
+        };
+        runCudaStep(0, true);
+        for (size_t i = 1; i < numFields; ++i)
+            runCudaStep(i, false);
+        mesh.performExchangeAndAccumulate(numFields);
+#else
         mesh.rasterize_particles_to_mesh_sph_multi(x, y, z, h, field_ptrs, numFields);
 #endif
+    }
 }
 
 } // namespace
@@ -225,10 +242,16 @@ bool run(Config const& config, int rank, int numRanks)
                       << "; using gridDim = numRanks (each rank needs at least one z-slab)." << std::endl;
         gridDim = numRanks;
     }
+    if (gridDim % numRanks != 0)
+    {
+        int roundedUp = ((gridDim + numRanks - 1) / numRanks) * numRanks;
+        if (rank == 0)
+            std::cerr << "gridDim " << gridDim << " not divisible by numRanks " << numRanks
+                      << "; rounding up to " << roundedUp << "." << std::endl;
+        gridDim = roundedUp;
+    }
     double meshLmin = (config.lbox > 0.0 && typeLower == "tipsy") ? 0.0 : -0.5;
     double meshLmax = (config.lbox > 0.0 && typeLower == "tipsy") ? config.lbox : 0.5;
-
-    Mesh<T> mesh(rank, numRanks, gridDim, meshLmin, meshLmax);
 
     std::vector<KeyType> keys(x.size());
     size_t bucketSizeFocus = 64;
@@ -257,31 +280,40 @@ bool run(Config const& config, int rank, int numRanks)
     float t_sync = timer.elapsed("Sync");
 
     std::vector<std::vector<T>*> extraFieldPtrs;
-    for (size_t i = 0; i < numExtra; ++i)
-        extraFieldPtrs.push_back(&extraFields[i]);
-    rasterize_dispatch(mesh, config.interpolation, keys, x, y, z, h, mass, extraFieldPtrs);
+    for (size_t i = 0; i < numExtra; ++i) extraFieldPtrs.push_back(&extraFields[i]);
 
-    std::cout << "rasterized" << std::endl;
-    float t_raster = timer.elapsed("Rasterization");
-
+    float t_raster = 0.f;
     float t_write = 0.f;
+
+    Mesh<T> mesh(rank, numRanks, gridDim, meshLmin, meshLmax);
+    rasterize_dispatch(mesh, config.interpolation, keys, x, y, z, h, mass, extraFieldPtrs);
+    std::cout << "rasterized" << std::endl;
+    t_raster = timer.elapsed("Rasterization");
+
     if (config.write_output)
     {
         const size_t numFields = mesh.numFields();
 
         if (config.output_format == OutputFormat::Text)
         {
-            // Text output: rank 0 gathers full grid (or writes local only for single rank)
-            if (rank == 0)
+            // Gather all z-slabs from every rank to rank 0, then write the complete grid.
+            // MPI_Gather is safe here because gridDim is always divisible by numRanks (enforced above).
+            const int localCount = static_cast<int>(mesh.grid_fields_[0].size());
+            for (size_t f = 0; f < numFields; ++f)
             {
-                for (size_t f = 0; f < numFields; ++f)
+                std::vector<T> globalField;
+                if (rank == 0) globalField.resize(static_cast<size_t>(localCount) * numRanks);
+                MPI_Gather(mesh.grid_fields_[f].data(), localCount, MPI_DOUBLE,
+                           rank == 0 ? globalField.data() : nullptr, localCount, MPI_DOUBLE,
+                           0, MPI_COMM_WORLD);
+                if (rank == 0)
                 {
                     std::string fname = (f == 0)
                         ? config.output_path + ".txt"
                         : config.extra_field_names[f - 1] + ".txt";
                     std::ofstream file(fname);
-                    for (size_t i = 0; i < mesh.grid_fields_[f].size(); ++i)
-                        file << i << " " << std::scientific << mesh.grid_fields_[f][i] << "\n";
+                    for (size_t i = 0; i < globalField.size(); ++i)
+                        file << i << " " << std::scientific << globalField[i] << "\n";
                     file.close();
                     std::cout << "Saved " << (f == 0 ? "density" : config.extra_field_names[f - 1])
                               << " to " << fname << std::endl;
@@ -298,14 +330,11 @@ bool run(Config const& config, int rank, int numRanks)
             if (!h5File)
                 throw std::runtime_error("Failed to open HDF5 output file: " + h5path);
 
-            // Set step 0
             H5PartSetStep(h5File, 0);
 
-            // Each rank writes its local portion (z-slab): localSize cells
             uint64_t localSize = mesh.grid_fields_[0].size();
             H5PartSetNumParticles(h5File, static_cast<h5part_int64_t>(localSize));
 
-            // Write grid metadata as step attributes
             int gridDimAttr = mesh.gridDim_;
             int numRanksAttr = numRanks;
             fileutils::writeH5PartStepAttrib(h5File, "gridDim", &gridDimAttr, 1);
@@ -314,7 +343,6 @@ bool run(Config const& config, int rank, int numRanks)
             fileutils::writeH5PartStepAttrib(h5File, "Lmin", &lminAttr, 1);
             fileutils::writeH5PartStepAttrib(h5File, "Lmax", &lmaxAttr, 1);
 
-            // Write each field
             for (size_t f = 0; f < numFields; ++f)
             {
                 std::string fieldName = (f == 0) ? "density" : config.extra_field_names[f - 1];
@@ -322,7 +350,7 @@ bool run(Config const& config, int rank, int numRanks)
             }
 
             H5PartCloseFile(h5File);
-            MPI_Barrier(MPI_COMM_WORLD);  // ensure all ranks finish writing before timing
+            MPI_Barrier(MPI_COMM_WORLD);
             t_write = timer.elapsed("Output write");
             if (rank == 0)
                 std::cout << "Saved " << numFields << " field(s) to " << h5path << " (parallel HDF5)" << std::endl;

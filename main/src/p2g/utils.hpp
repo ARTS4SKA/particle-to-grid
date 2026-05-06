@@ -36,6 +36,12 @@ inline int exitSuccess()
     return EXIT_SUCCESS;
 }
 
+inline int exitFailure()
+{
+    MPI_Finalize();
+    return EXIT_FAILURE;
+}
+
 class Timer
 {
     using Clock = std::chrono::high_resolution_clock;
