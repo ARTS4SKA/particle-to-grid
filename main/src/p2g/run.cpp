@@ -1,5 +1,4 @@
 #include "p2g/run.hpp"
-#include "p2g/config.hpp"
 #include "p2g/utils.hpp"
 #include "mesh.hpp"
 #include "ifile_io_impl.h"
@@ -17,155 +16,105 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 
 using namespace sphexa;
 
 namespace p2g {
 
+using T = double;
+
 namespace {
 
-template<typename T>
-void rasterize_single(Mesh<T>& mesh, InterpolationMethod method,
-                      std::vector<KeyType>& keys,
-                      std::vector<T>& x, std::vector<T>& y, std::vector<T>& z,
-                      std::vector<T>& h, std::vector<T>& values)
+// Fixed number of scalar field slots (mass + extras). All slots are always passed to
+// domain.sync so there is a single fixed-arity call; unused slots stay zero.
+constexpr size_t MAX_FIELDS = 9;
+
+// Next power of two >= floor(cbrt(N)).
+int defaultGridDim(size_t numParticles)
 {
-    if (method == InterpolationMethod::NearestNeighbor)
+    const size_t simDim = std::cbrt(numParticles);
+    return static_cast<int>(std::pow(2, std::ceil(std::log2(simDim))));
+}
+
+// Smallest multiple of numRanks that is >= max(gridDim, numRanks), as the z-slab split requires.
+int slabCompatibleGridDim(int gridDim, int numRanks, int rank)
+{
+    int adjusted = std::max(gridDim, numRanks);
+    adjusted     = (adjusted + numRanks - 1) / numRanks * numRanks;
+    if (adjusted != gridDim && rank == 0)
+        std::cerr << "gridDim " << gridDim << " is not a positive multiple of numRanks " << numRanks
+                  << "; using " << adjusted << ".\n";
+    return adjusted;
+}
+
+void writeText(const CartesianGrid<T>& grid, const std::vector<std::string>& names, int rank, int numRanks)
+{
+    const int localCount = static_cast<int>(grid.localSize());
+    for (size_t f = 0; f < names.size(); ++f)
     {
-#ifdef USE_CUDA
-        rasterize_particles_to_mesh_cuda(mesh, keys, x, y, z, values);
-#else
-        mesh.rasterize_particles_to_mesh(keys, x, y, z, values);
-#endif
-    }
-    else if (method == InterpolationMethod::CellAverage)
-    {
-#ifdef USE_CUDA
-        rasterize_particles_to_mesh_cuda_cell_average(mesh, keys, values);
-#else
-        mesh.rasterize_particles_to_mesh_cell_average(keys, values);
-#endif
-    }
-    else
-    {
-#ifdef USE_CUDA
-        rasterize_particles_to_mesh_cuda_sph(mesh, x, y, z, h, values);
-#else
-        mesh.rasterize_particles_to_mesh_sph(x, y, z, h, values);
-#endif
+        std::vector<T> global(rank == 0 ? grid.localSize() * numRanks : 0);
+        MPI_Gather(grid.grid_fields_[f].data(), localCount, MPI_DOUBLE, global.data(), localCount, MPI_DOUBLE, 0,
+                   MPI_COMM_WORLD);
+        if (rank != 0) continue;
+
+        const std::string fname = names[f] + ".txt";
+        std::ofstream     file(fname);
+        for (size_t i = 0; i < global.size(); ++i)
+            file << i << " " << std::scientific << global[i] << "\n";
+        std::cout << "Saved " << fname << std::endl;
     }
 }
 
-template<typename T>
-void rasterize_dispatch(Mesh<T>& mesh, InterpolationMethod method,
-                        std::vector<KeyType>& keys,
-                        std::vector<T>& x, std::vector<T>& y, std::vector<T>& z,
-                        std::vector<T>& h, std::vector<T>& mass,
-                        const std::vector<std::vector<T>*>& extraFields = {})
+#ifdef SPH_EXA_HAVE_H5PART
+void writeHdf5(const CartesianGrid<T>& grid, const std::string& path, const std::vector<std::string>& fieldNames,
+               int rank, int numRanks)
 {
-    const size_t numFields = 1u + extraFields.size();
-    mesh.ensureNumFields(numFields);
+    H5PartFile* h5File = fileutils::openH5Part(path, H5PART_WRITE | H5PART_VFD_MPIIO_IND, MPI_COMM_WORLD);
+    if (!h5File) throw std::runtime_error("Failed to open HDF5 output file: " + path);
 
-    std::vector<std::vector<T>*> field_ptrs;
-    field_ptrs.push_back(&mass);
-    for (size_t i = 0; i < extraFields.size(); ++i)
-    {
-        if (!extraFields[i] || extraFields[i]->size() != mass.size())
-            throw std::runtime_error("Extra field size mismatch in rasterize_dispatch");
-        field_ptrs.push_back(extraFields[i]);
-    }
+    H5PartSetStep(h5File, 0);
+    H5PartSetNumParticles(h5File, static_cast<h5part_int64_t>(grid.localSize()));
 
-    if (numFields == 1)
-    {
-        mesh.setOutputFieldIndex(0);
-        rasterize_single(mesh, method, keys, x, y, z, h, mass);
-        return;
-    }
+    int    gridDim = grid.gridDim_;
+    double lmin    = grid.Lmin_;
+    double lmax    = grid.Lmax_;
+    fileutils::writeH5PartStepAttrib(h5File, "gridDim", &gridDim, 1);
+    fileutils::writeH5PartStepAttrib(h5File, "numRanks", &numRanks, 1);
+    fileutils::writeH5PartStepAttrib(h5File, "Lmin", &lmin, 1);
+    fileutils::writeH5PartStepAttrib(h5File, "Lmax", &lmax, 1);
 
-    // Multi-field path
-    if (method == InterpolationMethod::NearestNeighbor)
-    {
-        // NN uses min-distance replacement: each field runs independently (same nearest particle wins)
-#ifdef USE_CUDA
-        for (size_t i = 0; i < numFields; ++i)
-        {
-            mesh.setOutputFieldIndex(i);
-            rasterize_particles_to_mesh_cuda(mesh, keys, x, y, z, *field_ptrs[i], true, true);
-        }
-#else
-        mesh.rasterize_particles_to_mesh_multi(keys, x, y, z, field_ptrs, numFields);
-#endif
-    }
-    else if (method == InterpolationMethod::CellAverage)
-    {
-        // CA uses accumulate+count: each field runs independently on GPU, single pass on CPU
-#ifdef USE_CUDA
-        for (size_t i = 0; i < numFields; ++i)
-        {
-            mesh.setOutputFieldIndex(i);
-            rasterize_particles_to_mesh_cuda_cell_average(mesh, keys, *field_ptrs[i], true, true);
-        }
-#else
-        mesh.rasterize_particles_to_mesh_cell_average_multi(keys, field_ptrs, numFields);
-#endif
-    }
-    else // SPH
-    {
-#ifdef USE_CUDA
-        auto runCudaStep = [&](size_t fieldIdx, bool doReset) {
-            mesh.setOutputFieldIndex(fieldIdx);
-            rasterize_particles_to_mesh_cuda_sph(mesh, x, y, z, h, *field_ptrs[fieldIdx], false, doReset);
-        };
-        runCudaStep(0, true);
-        for (size_t i = 1; i < numFields; ++i)
-            runCudaStep(i, false);
-        mesh.performExchangeAndAccumulate(numFields);
-#else
-        mesh.rasterize_particles_to_mesh_sph_multi(x, y, z, h, field_ptrs, numFields);
-#endif
-    }
+    for (size_t f = 0; f < fieldNames.size(); ++f)
+        fileutils::writeH5PartField(h5File, fieldNames[f], grid.grid_fields_[f].data());
+
+    H5PartCloseFile(h5File);
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) std::cout << "Saved " << fieldNames.size() << " field(s) to " << path << std::endl;
 }
+#endif
 
 } // namespace
 
-bool run(Config const& config, int rank, int numRanks)
+void run(const Config& config, int rank, int numRanks)
 {
-    using T = double;
-    std::string typeLower = config.checkpoint_type;
-    std::transform(typeLower.begin(), typeLower.end(), typeLower.begin(), ::tolower);
+    const bool tipsy = config.checkpoint_type == CheckpointType::Tipsy;
 
-    std::unique_ptr<IFileReader> reader;
-    if (typeLower == "tipsy")
-    {
-        reader = makeTipsyReader(MPI_COMM_WORLD);
-        reader->setStep(config.checkpoint_path, 0, FileMode::collective);
-    }
-    else if (typeLower == "hdf5")
-    {
-        reader = makeH5PartReader(MPI_COMM_WORLD);
-        reader->setStep(config.checkpoint_path, config.step_no, FileMode::collective);
-    }
-    else
-    {
-        if (rank == 0) std::cerr << "Unknown --checkpoint-type. Use 'hdf5' or 'tipsy'.\n";
-        return false;
-    }
+    std::unique_ptr<IFileReader> reader = tipsy ? makeTipsyReader(MPI_COMM_WORLD) : makeH5PartReader(MPI_COMM_WORLD);
+    reader->setStep(config.checkpoint_path, tipsy ? 0 : config.step_no, FileMode::collective);
 
-    size_t numParticles = reader->globalNumParticles();
-    if (rank == 0)
-    {
-        std::cout << "Configuration: checkpoint_type=" << typeLower
-                  << " interpolation=" << to_string(config.interpolation) << std::endl;
-        std::cout << "Total number of particles: " << numParticles << std::endl;
-    }
-    size_t simDim = std::cbrt(numParticles);
+    const size_t numParticles = reader->globalNumParticles();
+    const size_t localNum     = reader->localNumParticles();
+    if (rank == 0) std::cout << "Total particles: " << numParticles << std::endl;
 
-    const size_t localNum = reader->localNumParticles();
-    std::vector<T> x(localNum), y(localNum), z(localNum);
-    std::vector<T> h(localNum, T(0));
-    std::vector<T> mass(localNum, T(1));
+    const size_t numExtra = std::min(config.extra_field_names.size(), MAX_FIELDS - 1);
+    if (config.extra_field_names.size() > numExtra && rank == 0)
+        std::cerr << "Warning: only " << numExtra << " extra fields supported; ignoring the rest.\n";
+    const size_t numFields = 1 + numExtra;
+
+    std::vector<T> x(localNum), y(localNum), z(localNum), h(localNum, T(0));
     std::vector<T> scratch1(localNum), scratch2(localNum), scratch3(localNum);
+    std::array<std::vector<T>, MAX_FIELDS> fields;
+    for (auto& f : fields)
+        f.assign(localNum, T(0));
 
     Timer timer(std::cout);
     timer.start();
@@ -173,206 +122,103 @@ bool run(Config const& config, int rank, int numRanks)
     reader->readField("x", x.data());
     reader->readField("y", y.data());
     reader->readField("z", z.data());
-    bool hasSmoothingLength = false;
-    try
-    {
-        reader->readField("h", h.data());
-        hasSmoothingLength = true;
-    }
-    catch (...) {}
-    try
-    {
-        reader->readField("m", mass.data());
-    }
-    catch (...)
-    {
-        if (rank == 0) std::cerr << "mass field not available" << std::endl;
-        return false;
-    }
-
-    // Optional extra quantities (e.g. temperature): read by name
-    constexpr size_t MAX_EXTRA_FIELDS = 8;
-    const size_t numExtra = std::min(config.extra_field_names.size(), MAX_EXTRA_FIELDS);
-    std::array<std::vector<T>, MAX_EXTRA_FIELDS> extraFields;
+    try { reader->readField("h", h.data()); } catch (...) {}
+    try { reader->readField("m", fields[0].data()); }
+    catch (...) { throw std::runtime_error("mass field 'm' not available"); }
     for (size_t i = 0; i < numExtra; ++i)
     {
-        extraFields[i].resize(localNum, T(0));
-        try
-        {
-            reader->readField(config.extra_field_names[i], extraFields[i].data());
-        }
+        try { reader->readField(config.extra_field_names[i], fields[1 + i].data()); }
         catch (...)
         {
             if (rank == 0)
                 std::cerr << "Extra field '" << config.extra_field_names[i] << "' not found; using zeros.\n";
-            std::fill(extraFields[i].begin(), extraFields[i].end(), T(0));
         }
     }
     reader->closeStep();
 
-    if (config.interpolation == InterpolationMethod::SPH && !hasSmoothingLength)
+    // TIPSY positions are in [-0.5, 0.5); map them to [0, lbox) and masses to physical units.
+    if (tipsy)
     {
-        if (rank == 0)
-            std::cerr << "SPH requires 'h' in the checkpoint. Use --interpolation nearest or cell_average.\n";
-        return false;
-    }
-
-    if (config.lbox > 0.0 && typeLower == "tipsy")
-    {
-        for (size_t i = 0; i < x.size(); ++i)
+        const T massScale = config.rho_crit > 0.0 ? config.rho_crit * config.lbox * config.lbox * config.lbox : T(1);
+        for (size_t i = 0; i < localNum; ++i)
         {
             x[i] = (x[i] + T(0.5)) * config.lbox;
             y[i] = (y[i] + T(0.5)) * config.lbox;
             z[i] = (z[i] + T(0.5)) * config.lbox;
-            if (config.rho_crit > 0.0)
-                mass[i] *= config.rho_crit * config.lbox * config.lbox * config.lbox;
+            fields[0][i] *= massScale;
         }
     }
+    const double boxMin = tipsy ? 0.0 : -0.5;
+    const double boxMax = tipsy ? config.lbox : 0.5;
 
     float t_read = timer.elapsed("Checkpoint read");
-    std::cout << "Read " << reader->localNumParticles() << " particles on rank " << rank << std::endl;
 
-    int gridDim = (config.grid_size > 0)
-                      ? config.grid_size
-                      : static_cast<int>(std::pow(2, std::ceil(std::log(simDim) / std::log(2))));
-    if (gridDim < numRanks)
-    {
-        if (rank == 0)
-            std::cerr << "gridSize " << gridDim << " < numRanks " << numRanks
-                      << "; using gridDim = numRanks (each rank needs at least one z-slab)." << std::endl;
-        gridDim = numRanks;
-    }
-    if (gridDim % numRanks != 0)
-    {
-        int roundedUp = ((gridDim + numRanks - 1) / numRanks) * numRanks;
-        if (rank == 0)
-            std::cerr << "gridDim " << gridDim << " not divisible by numRanks " << numRanks
-                      << "; rounding up to " << roundedUp << "." << std::endl;
-        gridDim = roundedUp;
-    }
-    double meshLmin = (config.lbox > 0.0 && typeLower == "tipsy") ? 0.0 : -0.5;
-    double meshLmax = (config.lbox > 0.0 && typeLower == "tipsy") ? config.lbox : 0.5;
-
-    std::vector<KeyType> keys(x.size());
-    size_t bucketSizeFocus = 64;
-    size_t bucketSize     = std::max(bucketSizeFocus, numParticles / (100 * numRanks));
-    float theta           = 1.0f;
-    cstone::Box<double> box(meshLmin, meshLmax, cstone::BoundaryType::periodic);
+    const size_t               bucketSizeFocus = 64;
+    const size_t               bucketSize      = std::max(bucketSizeFocus, numParticles / (100 * numRanks));
+    const float                theta           = 1.0f;
+    std::vector<KeyType>       keys(localNum);
+    cstone::Box<double>        box(boxMin, boxMax, cstone::BoundaryType::periodic);
     cstone::Domain<KeyType, T, cstone::CpuTag> domain(rank, numRanks, bucketSize, bucketSizeFocus, theta, box);
 
-    auto scratch = std::tie(scratch1, scratch2, scratch3);
-    switch (1u + numExtra)
-    {
-        case 1: domain.sync(keys, x, y, z, h, std::tie(mass), scratch); break;
-        case 2: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0]), scratch); break;
-        case 3: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0], extraFields[1]), scratch); break;
-        case 4: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0], extraFields[1], extraFields[2]), scratch); break;
-        case 5: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0], extraFields[1], extraFields[2], extraFields[3]), scratch); break;
-        case 6: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0], extraFields[1], extraFields[2], extraFields[3], extraFields[4]), scratch); break;
-        case 7: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0], extraFields[1], extraFields[2], extraFields[3], extraFields[4], extraFields[5]), scratch); break;
-        case 8: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0], extraFields[1], extraFields[2], extraFields[3], extraFields[4], extraFields[5], extraFields[6]), scratch); break;
-        case 9: domain.sync(keys, x, y, z, h, std::tie(mass, extraFields[0], extraFields[1], extraFields[2], extraFields[3], extraFields[4], extraFields[5], extraFields[6], extraFields[7]), scratch); break;
-        default: break;
-    }
-    scratch1.clear();
-    scratch2.clear();
-    scratch3.clear();
+    domain.sync(keys, x, y, z, h,
+                std::tie(fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7],
+                         fields[8]),
+                std::tie(scratch1, scratch2, scratch3));
+
     float t_sync = timer.elapsed("Sync");
 
-    std::vector<std::vector<T>*> extraFieldPtrs;
-    for (size_t i = 0; i < numExtra; ++i) extraFieldPtrs.push_back(&extraFields[i]);
+    const int gridDim = slabCompatibleGridDim(
+        config.grid_size > 0 ? config.grid_size : defaultGridDim(numParticles), numRanks, rank);
 
-    float t_raster = 0.f;
+    // Drop halo particles: their fields are not synced, and they belong to other ranks anyway.
+    auto ownedOnly = [&](auto& v)
+    {
+        v.erase(v.begin() + domain.endIndex(), v.end());
+        v.erase(v.begin(), v.begin() + domain.startIndex());
+    };
+    ownedOnly(keys);
+    std::vector<std::vector<T>*> field_ptrs;
+    for (size_t f = 0; f < numFields; ++f)
+    {
+        ownedOnly(fields[f]);
+        field_ptrs.push_back(&fields[f]);
+    }
+
+    CartesianGrid<T> grid(rank, numRanks, gridDim, boxMin, boxMax);
+    grid.p2g(keys, field_ptrs);
+
+    float t_p2g   = timer.elapsed("P2G rasterization");
     float t_write = 0.f;
-
-    Mesh<T> mesh(rank, numRanks, gridDim, meshLmin, meshLmax);
-    rasterize_dispatch(mesh, config.interpolation, keys, x, y, z, h, mass, extraFieldPtrs);
-    std::cout << "rasterized" << std::endl;
-    t_raster = timer.elapsed("Rasterization");
 
     if (config.write_output)
     {
-        const size_t numFields = mesh.numFields();
-
         if (config.output_format == OutputFormat::Text)
         {
-            // Gather all z-slabs from every rank to rank 0, then write the complete grid.
-            // MPI_Gather is safe here because gridDim is always divisible by numRanks (enforced above).
-            const int localCount = static_cast<int>(mesh.grid_fields_[0].size());
-            for (size_t f = 0; f < numFields; ++f)
-            {
-                std::vector<T> globalField;
-                if (rank == 0) globalField.resize(static_cast<size_t>(localCount) * numRanks);
-                MPI_Gather(mesh.grid_fields_[f].data(), localCount, MPI_DOUBLE,
-                           rank == 0 ? globalField.data() : nullptr, localCount, MPI_DOUBLE,
-                           0, MPI_COMM_WORLD);
-                if (rank == 0)
-                {
-                    std::string fname = (f == 0)
-                        ? config.output_path + ".txt"
-                        : config.extra_field_names[f - 1] + ".txt";
-                    std::ofstream file(fname);
-                    for (size_t i = 0; i < globalField.size(); ++i)
-                        file << i << " " << std::scientific << globalField[i] << "\n";
-                    file.close();
-                    std::cout << "Saved " << (f == 0 ? "density" : config.extra_field_names[f - 1])
-                              << " to " << fname << std::endl;
-                }
-            }
-            t_write = timer.elapsed("Output write");
+            std::vector<std::string> fileNames{config.output_path};
+            fileNames.insert(fileNames.end(), config.extra_field_names.begin(),
+                             config.extra_field_names.begin() + numExtra);
+            writeText(grid, fileNames, rank, numRanks);
         }
-        else // HDF5 output: all ranks write in parallel
+        else
         {
 #ifdef SPH_EXA_HAVE_H5PART
-            std::string h5path = config.output_path + ".h5";
-            int64_t mode = H5PART_WRITE | H5PART_VFD_MPIIO_IND;
-            H5PartFile* h5File = fileutils::openH5Part(h5path, mode, MPI_COMM_WORLD);
-            if (!h5File)
-                throw std::runtime_error("Failed to open HDF5 output file: " + h5path);
-
-            H5PartSetStep(h5File, 0);
-
-            uint64_t localSize = mesh.grid_fields_[0].size();
-            H5PartSetNumParticles(h5File, static_cast<h5part_int64_t>(localSize));
-
-            int gridDimAttr = mesh.gridDim_;
-            int numRanksAttr = numRanks;
-            fileutils::writeH5PartStepAttrib(h5File, "gridDim", &gridDimAttr, 1);
-            fileutils::writeH5PartStepAttrib(h5File, "numRanks", &numRanksAttr, 1);
-            double lminAttr = mesh.Lmin_, lmaxAttr = mesh.Lmax_;
-            fileutils::writeH5PartStepAttrib(h5File, "Lmin", &lminAttr, 1);
-            fileutils::writeH5PartStepAttrib(h5File, "Lmax", &lmaxAttr, 1);
-
-            for (size_t f = 0; f < numFields; ++f)
-            {
-                std::string fieldName = (f == 0) ? "density" : config.extra_field_names[f - 1];
-                fileutils::writeH5PartField(h5File, fieldName, mesh.grid_fields_[f].data());
-            }
-
-            H5PartCloseFile(h5File);
-            MPI_Barrier(MPI_COMM_WORLD);
-            t_write = timer.elapsed("Output write");
-            if (rank == 0)
-                std::cout << "Saved " << numFields << " field(s) to " << h5path << " (parallel HDF5)" << std::endl;
+            std::vector<std::string> fieldNames{"density"};
+            fieldNames.insert(fieldNames.end(), config.extra_field_names.begin(),
+                              config.extra_field_names.begin() + numExtra);
+            writeHdf5(grid, config.output_path + ".h5", fieldNames, rank, numRanks);
 #else
-            if (rank == 0)
-                std::cerr << "HDF5 output requested but H5Part support not compiled in. Use --output-format text.\n";
+            throw std::runtime_error("HDF5 output requested but H5Part not compiled in. Use --output-format text.");
 #endif
         }
+        t_write = timer.elapsed("Output write");
     }
 
     if (rank == 0)
     {
-        float total = timer.totalElapsed();
-        std::cout << "Timing summary: checkpoint_type=" << typeLower
-                  << " interpolation=" << to_string(config.interpolation)
-                  << " output=" << to_string(config.output_format)
-                  << " | read=" << std::fixed << std::setprecision(4) << t_read
-                  << " s sync=" << t_sync << " s rasterize=" << t_raster
-                  << " s write=" << t_write << " s total=" << total << " s" << std::endl;
+        std::cout << "Timing: read=" << std::fixed << std::setprecision(4) << t_read << " s  sync=" << t_sync
+                  << " s  p2g=" << t_p2g << " s  write=" << t_write << " s  total=" << timer.totalElapsed() << " s"
+                  << std::endl;
     }
-
-    return true;
 }
 
 } // namespace p2g

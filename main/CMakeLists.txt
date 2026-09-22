@@ -1,5 +1,3 @@
-set(CSTONE_DIR ${PROJECT_SOURCE_DIR}/cstone/include)
-
 add_subdirectory(src)
 
 if(BUILD_TESTING)

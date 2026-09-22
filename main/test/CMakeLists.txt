@@ -1,41 +1,27 @@
 include(particleToGrid_add_test)
+include(setup_GTest)
 
-function(addMpiTest source exename testname ranks)
-    add_executable(${exename} ${source})
-    target_include_directories(${exename} PRIVATE ${MPI_CXX_INCLUDE_PATH} ${CSTONE_DIR} ${PROJECT_SOURCE_DIR}/main/src)
+# Uses cstone's MPI-aware GTest driver (test_main.cpp + gtest-mpi-listener.hpp).
+function(addParticleToGridTest exename source)
+    add_executable(${exename} ${source} ${CSTONE_TEST_DIR}/integration_mpi/test_main.cpp)
+    target_include_directories(${exename} PRIVATE
+        ${MPI_CXX_INCLUDE_PATH} ${CSTONE_DIR} ${CSTONE_TEST_DIR}/integration_mpi
+        ${PROJECT_SOURCE_DIR}/main/src ${PROJECT_SOURCE_DIR}/extern/io)
+    target_compile_definitions(${exename} PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/data")
     target_compile_options(${exename} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
-    target_link_libraries(${exename} PRIVATE ${MPI_CXX_LIBRARIES} GTest::gtest_main)
-
-    if(ENABLE_H5PART)
-        enableH5Part(${exename})
-    endif()
-
-    particleToGrid_add_test(${testname} EXECUTABLE ${exename} RANKS ${ranks})
+    target_link_libraries(${exename} PRIVATE ${MPI_CXX_LIBRARIES} GTest::gtest io)
+    # GTest is resolved from a conda environment whose lib dir ends up in the
+    # RPATH; its bundled libssl.so.3 is missing symbols the system libcurl
+    # needs. Prepend the system lib dir so it's found first.
+    set_target_properties(${exename} PROPERTIES BUILD_RPATH "/usr/lib/x86_64-linux-gnu")
     install(TARGETS ${exename} RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}/integration_mpi)
 endfunction()
 
-function(addParticleToGridMpiTest source exename testname ranks)
-    list(APPEND source test_main.cpp)
-    addMpiTest("${source}" ${exename} ${testname} ${ranks})
-endfunction()
+addParticleToGridTest(mesh_mpi mesh_tests.cpp)
+addParticleToGridTest(interpolation_mpi interpolation_tests.cpp)
+addParticleToGridTest(file_io_mpi file_io_tests.cpp)
 
-addParticleToGridMpiTest(mesh_tests.cpp mesh_mpi meshTest 4)
-addParticleToGridMpiTest(interpolation_tests.cpp interpolation_mpi InterpolationTest 1)
-
-# File I/O tests: need io library and data path
-function(addFileIoTest source exename testname ranks)
-    add_executable(${exename} ${source} test_main.cpp)
-    target_include_directories(${exename} PRIVATE
-        ${MPI_CXX_INCLUDE_PATH} ${CSTONE_DIR} ${PROJECT_SOURCE_DIR}/main/src ${PROJECT_SOURCE_DIR}/extern/io)
-    target_compile_definitions(${exename} PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/data")
-    target_compile_options(${exename} PRIVATE -Wall -Wextra -Wno-unknown-pragmas)
-    target_link_libraries(${exename} PRIVATE ${MPI_CXX_LIBRARIES} GTest::gtest_main io)
-    if(ENABLE_H5PART)
-        enableH5Part(${exename})
-    endif()
-    particleToGrid_add_test(${testname} EXECUTABLE ${exename} RANKS ${ranks})
-endfunction()
-addFileIoTest(file_io_tests.cpp file_io_mpi FileIOTest 1)
-
-# HDF5 output test with multiple ranks (for parallel write/read validation)
-addFileIoTest(file_io_tests.cpp file_io_mpi_multi FileIOTestMultiRank 4)
+particleToGrid_add_test(meshTest EXECUTABLE mesh_mpi RANKS 4)
+particleToGrid_add_test(InterpolationTest EXECUTABLE interpolation_mpi RANKS 1)
+particleToGrid_add_test(FileIOTest EXECUTABLE file_io_mpi RANKS 1)
+particleToGrid_add_test(FileIOTestMultiRank EXECUTABLE file_io_mpi RANKS 4)

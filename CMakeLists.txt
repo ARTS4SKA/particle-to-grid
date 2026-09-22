@@ -1,16 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(partile-to-grid CXX)
-project(partile-to-grid C)
+project(particle-to-grid C CXX)
 set(CMAKE_CXX_STANDARD 20)
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 
-list(APPEND CMAKE_MODULE_PATH
-    "${PROJECT_SOURCE_DIR}/cmake"
-    "${PROJECT_SOURCE_DIR}/main/cmake"
-)
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/main/cmake")
 
 option(BUILD_TESTING "build unit and integration tests" ON)
 option(GPU_DIRECT "Enable CUDA-aware MPI communication" OFF)
@@ -49,6 +45,16 @@ if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     find_package(CUDAToolkit)
     set(CMAKE_CUDA_STANDARD 20)
+
+    # CUDA toolkits >= 12.9 ship the CCCL headers (thrust/cub/libcudacxx) under
+    # an extra "cccl" subdirectory; this CMake version's FindCUDAToolkit
+    # doesn't know about that layout, so host-compiled (non-nvcc) sources that
+    # include thrust/cub headers directly fail to find them. Add it explicitly.
+    foreach(_cuda_inc_dir ${CUDAToolkit_INCLUDE_DIRS})
+        if(EXISTS "${_cuda_inc_dir}/cccl")
+            target_include_directories(CUDA::cudart INTERFACE "${_cuda_inc_dir}/cccl")
+        endif()
+    endforeach()
 endif()
 
 check_language(HIP)

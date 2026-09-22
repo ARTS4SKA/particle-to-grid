@@ -1,7 +1,10 @@
 #pragma once
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <ostream>
+#include <string>
 #include <tuple>
 
 #include <omp.h>
@@ -48,33 +51,28 @@ class Timer
     using Time  = std::chrono::duration<float>;
 
 public:
-    explicit Timer(std::ostream& out) : out(out) {}
-
-    void start()
+    explicit Timer(std::ostream& out)
+        : out(out)
     {
-        tstart = tlast = Clock::now();
-        t0 = tstart;
     }
 
-    /** Returns elapsed seconds since last start() or elapsed() call, and prints to stream. */
+    void start() { t0 = tlap = Clock::now(); }
+
+    // Seconds since the previous start()/elapsed() call; also printed with the label.
     float elapsed(const std::string& label)
     {
-        tlast = Clock::now();
-        float sec = std::chrono::duration_cast<Time>(tlast - tstart).count();
+        auto  now = Clock::now();
+        float sec = std::chrono::duration_cast<Time>(now - tlap).count();
         out << label << " elapsed time: " << sec << " s" << std::endl;
-        tstart = tlast;
+        tlap = now;
         return sec;
     }
 
-    /** Returns total seconds since first start(). */
-    float totalElapsed() const
-    {
-        return std::chrono::duration_cast<Time>(Clock::now() - t0).count();
-    }
+    float totalElapsed() const { return std::chrono::duration_cast<Time>(Clock::now() - t0).count(); }
 
 private:
     std::ostream&     out;
-    Clock::time_point t0, tstart, tlast;
+    Clock::time_point t0, tlap;
 };
 
 } // namespace p2g

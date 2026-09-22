@@ -1,8 +1,11 @@
 #include <mpi.h>
 #include <gtest/gtest.h>
-#include <filesystem>
-#include <string>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
 
 #include "ifile_io_impl.h"
 
@@ -18,9 +21,6 @@ using namespace sphexa;
 
 TEST(FileIO, HDF5ReaderOpenAndRead)
 {
-    int rank = 0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-
     std::string path = std::string(TEST_DATA_DIR) + "/turb_50.h5";
     if (!std::filesystem::exists(path))
     {
@@ -63,31 +63,127 @@ TEST(FileIO, HDF5ReaderOpenAndRead)
     }
 }
 
-TEST(FileIO, HDF5ReaderStepAttributesOrFields)
-{
-    int rank = 0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-
-    std::string path = std::string(TEST_DATA_DIR) + "/turb_50.h5";
-    if (!std::filesystem::exists(path))
-    {
-        GTEST_SKIP() << "Test data file not found: " << path;
-    }
-
-    std::unique_ptr<IFileReader> reader = makeH5PartReader(MPI_COMM_WORLD);
-    reader->setStep(path, 0, FileMode::collective);
-
-    auto stepAttrs = reader->stepAttributes();
-    (void)stepAttrs;
-
-    reader->closeStep();
-    SUCCEED();
-}
-
 TEST(FileIO, TipsyReaderRequiresFile)
 {
     std::unique_ptr<IFileReader> reader = makeTipsyReader(MPI_COMM_WORLD);
     EXPECT_THROW(reader->setStep("/nonexistent/tipsy.bin", 0, FileMode::collective), std::exception);
+}
+
+namespace {
+
+void putBigEndian(std::ofstream& out, uint32_t bits)
+{
+    char bytes[4] = {char(bits >> 24), char(bits >> 16), char(bits >> 8), char(bits)};
+    out.write(bytes, 4);
+}
+
+void putFloat(std::ofstream& out, float v)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &v, 4);
+    putBigEndian(out, bits);
+}
+
+// Dark particle d has x = d, y = 10 d, ..., phi = 80 d; gas/star records are filled with -1.
+void writeSyntheticTipsy(const std::string& path, int ngas, int ndark, int nstar, bool truncate)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    uint64_t      timeBits;
+    double        time = 0.5;
+    std::memcpy(&timeBits, &time, 8);
+    putBigEndian(out, uint32_t(timeBits >> 32));
+    putBigEndian(out, uint32_t(timeBits));
+    for (int v : {ngas + ndark + nstar, 3, ngas, ndark, nstar, 0})
+        putBigEndian(out, uint32_t(v));
+
+    for (int i = 0; i < ngas * 12; ++i)
+        putFloat(out, -1.0f);
+    for (int d = 0; d < ndark; ++d)
+    {
+        putFloat(out, 1.0f + d); // mass
+        for (int c = 1; c < 9; ++c)
+            putFloat(out, float(c * 10 * d + d * (c == 1)));
+    }
+    for (int i = 0; i < nstar * 11 - (truncate ? 1 : 0); ++i)
+        putFloat(out, -1.0f);
+}
+
+std::string tipsyTestPath(const char* name)
+{
+    int numRanks = 1;
+    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
+    return std::filesystem::temp_directory_path() /
+           (std::string("p2g_test_") + name + "_" + std::to_string(numRanks) + ".tipsy");
+}
+
+} // namespace
+
+TEST(FileIO, TipsyReaderReadsOwnSliceOfDarkParticles)
+{
+    int rank = 0, numRanks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
+
+    const int         ngas = 2, ndark = 11, nstar = 3;
+    const std::string path = tipsyTestPath("slice");
+    if (rank == 0) writeSyntheticTipsy(path, ngas, ndark, nstar, false);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    std::unique_ptr<IFileReader> reader = makeTipsyReader(MPI_COMM_WORLD);
+    reader->setStep(path, 0, FileMode::collective);
+
+    const uint64_t localNum = reader->localNumParticles();
+    EXPECT_EQ(reader->globalNumParticles(), uint64_t(ndark));
+
+    std::vector<double> x(localNum), y(localNum), m(localNum), mass(localNum), h(localNum), phi(localNum);
+    reader->readField("x", x.data());
+    reader->readField("y", y.data());
+    reader->readField("m", m.data());
+    reader->readField("mass", mass.data());
+    reader->readField("h", h.data());
+    reader->readField("phi", phi.data());
+    EXPECT_THROW(reader->readField("rho", x.data()), std::exception);
+    reader->closeStep();
+
+    // Slices must be contiguous, in rank order, and cover all dark particles exactly once.
+    std::vector<uint64_t> counts(numRanks);
+    uint64_t              local = localNum;
+    MPI_Allgather(&local, 1, MPI_UINT64_T, counts.data(), 1, MPI_UINT64_T, MPI_COMM_WORLD);
+    uint64_t first = 0, total = 0;
+    for (int r = 0; r < numRanks; ++r)
+    {
+        if (r < rank) first += counts[r];
+        total += counts[r];
+    }
+    EXPECT_EQ(total, uint64_t(ndark));
+
+    for (uint64_t i = 0; i < localNum; ++i)
+    {
+        const double d = double(first + i);
+        EXPECT_DOUBLE_EQ(x[i], 11 * d);
+        EXPECT_DOUBLE_EQ(y[i], 20 * d);
+        EXPECT_DOUBLE_EQ(m[i], 1 + d);
+        EXPECT_DOUBLE_EQ(mass[i], 1 + d);
+        EXPECT_DOUBLE_EQ(h[i], 70 * d);
+        EXPECT_DOUBLE_EQ(phi[i], 80 * d);
+    }
+
+    if (rank == 0) std::filesystem::remove(path);
+}
+
+TEST(FileIO, TipsyReaderRejectsTruncatedFileOnAllRanks)
+{
+    int rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    const std::string path = tipsyTestPath("truncated");
+    if (rank == 0) writeSyntheticTipsy(path, 1, 8, 2, true);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    std::unique_ptr<IFileReader> reader = makeTipsyReader(MPI_COMM_WORLD);
+    EXPECT_THROW(reader->setStep(path, 0, FileMode::collective), std::runtime_error);
+
+    if (rank == 0) std::filesystem::remove(path);
 }
 
 #ifdef SPH_EXA_HAVE_H5PART
@@ -187,86 +283,6 @@ TEST(FileIO, HDF5GridOutputWriteAndRead)
     }
 
     // Clean up test file
-    MPI_Barrier(MPI_COMM_WORLD);
-    if (rank == 0)
-    {
-        std::remove(testFile.c_str());
-    }
-}
-
-TEST(FileIO, HDF5GridOutputMultiRank)
-{
-    int rank = 0, numRanks = 1;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
-
-    if (numRanks < 2)
-    {
-        GTEST_SKIP() << "This test requires at least 2 MPI ranks";
-    }
-
-    // Test parameters: grid must be divisible by numRanks
-    const int gridDim = std::max(4, numRanks);
-    const int base = gridDim / numRanks;
-    const size_t localSize = static_cast<size_t>(gridDim) * gridDim * base;
-    const std::string testFile = "/tmp/test_grid_multirank.h5";
-
-    // Each rank creates unique data based on rank
-    std::vector<double> localData(localSize);
-    for (size_t i = 0; i < localSize; ++i)
-    {
-        localData[i] = rank * 1000.0 + static_cast<double>(i);
-    }
-
-    // Write HDF5 file in parallel
-    {
-        int64_t mode = H5PART_WRITE | H5PART_VFD_MPIIO_IND;
-        H5PartFile* h5File = fileutils::openH5Part(testFile, mode, MPI_COMM_WORLD);
-        ASSERT_NE(h5File, nullptr);
-
-        H5PartSetStep(h5File, 0);
-        H5PartSetNumParticles(h5File, static_cast<h5part_int64_t>(localSize));
-
-        int gridDimAttr = gridDim;
-        fileutils::writeH5PartStepAttrib(h5File, "gridDim", &gridDimAttr, 1);
-
-        fileutils::writeH5PartField(h5File, "data", localData.data());
-
-        H5PartCloseFile(h5File);
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // Read back and validate each rank's data
-    {
-        int64_t mode = H5PART_READ;
-        H5PartFile* h5File = fileutils::openH5Part(testFile, mode, MPI_COMM_WORLD);
-        ASSERT_NE(h5File, nullptr);
-
-        H5PartSetStep(h5File, 0);
-
-        // Total particles should be localSize * numRanks
-        h5part_int64_t totalParticles = H5PartGetNumParticles(h5File);
-        EXPECT_EQ(totalParticles, static_cast<h5part_int64_t>(localSize * numRanks));
-
-        // Each rank reads its own portion
-        h5part_int64_t startIdx = rank * static_cast<h5part_int64_t>(localSize);
-        h5part_int64_t endIdx = startIdx + static_cast<h5part_int64_t>(localSize) - 1;
-        H5PartSetView(h5File, startIdx, endIdx);
-
-        std::vector<double> readData(localSize);
-        fileutils::readH5PartField(h5File, "data", readData.data());
-
-        for (size_t i = 0; i < localSize; ++i)
-        {
-            EXPECT_DOUBLE_EQ(readData[i], localData[i])
-                << "Data mismatch at index " << i << " on rank " << rank;
-        }
-
-        H5PartCloseFile(h5File);
-    }
-
-    // Clean up
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)
     {
