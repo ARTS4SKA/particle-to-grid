@@ -241,3 +241,79 @@ def test_rejects_bad_arguments():
         grid.field(5)
     with pytest.raises(ValueError, match="grid holds"):
         grid.g2p(keys, num_fields=9)
+
+
+# --- SPH interpolation ----------------------------------------------------
+
+
+def test_sph_kernel_is_normalised():
+    h, n = 0.7, 200000
+    r = (np.arange(n) + 0.5) * 2 * h / n
+    w = np.array([p2g.sph_kernel(float(ri), h) for ri in r[::200]])
+    # Coarse sampling for speed; the C++ test integrates finely.
+    assert w[0] > 0
+    assert np.all(np.diff(w) <= 1e-18), "kernel must decrease monotonically"
+    assert p2g.sph_kernel(2 * h, h) == 0.0
+    assert p2g.sph_kernel(0.1, 0.0) == 0.0
+
+
+def test_sph_conserves_mass_and_spreads():
+    grid = make_grid(grid_dim=16)
+    grid.set_reduction(0, p2g.Reduction.Density)
+
+    x = y = z = np.array([0.5])
+    h = np.array([3.0 / 16])
+    mass = np.array([7.0])
+    grid.p2g_sph(x, y, z, h, [mass])
+
+    rho = grid.field(0)
+    assert (rho * grid.cell_volume).sum() == pytest.approx(7.0, rel=1e-12)
+    assert np.count_nonzero(rho) > 1, "the particle should reach several cells"
+
+
+def test_sph_subcell_h_falls_back_to_single_cell():
+    grid = make_grid(grid_dim=8)
+    grid.set_reduction(0, p2g.Reduction.Density)
+
+    x = y = z = np.array([0.5])
+    h = np.array([1e-9])  # far below the cell size
+    mass = np.array([3.0])
+    grid.p2g_sph(x, y, z, h, [mass])
+
+    rho = grid.field(0)
+    assert (rho * grid.cell_volume).sum() == pytest.approx(3.0, rel=1e-12), "mass must not vanish"
+    assert np.count_nonzero(rho) == 1
+
+
+def test_sph_is_smoother_than_nearest_cell():
+    rng = np.random.default_rng(3)
+    n = 2000
+    # Clustered, so the two schemes differ.
+    x, y, z = (np.clip(rng.normal(0.3, 0.05, n), 0.001, 0.999) for _ in range(3))
+    mass = np.full(n, 1.0 / n)
+    h = np.full(n, 2.0 / 16)
+
+    sph = make_grid(grid_dim=16)
+    sph.set_reduction(0, p2g.Reduction.Density)
+    sph.p2g_sph(x, y, z, h, [mass])
+
+    ngp = make_grid(grid_dim=16)
+    ngp.set_reduction(0, p2g.Reduction.Density)
+    ngp.p2g(p2g.hilbert_keys(x, y, z, lmin=LMIN, lmax=LMAX), [mass])
+
+    sph_rho, ngp_rho = sph.field(0), ngp.field(0)
+    # Both conserve mass; SPH occupies more cells with a lower peak.
+    assert (sph_rho * sph.cell_volume).sum() == pytest.approx(1.0, rel=1e-12)
+    assert (ngp_rho * ngp.cell_volume).sum() == pytest.approx(1.0, rel=1e-12)
+    assert np.count_nonzero(sph_rho) > np.count_nonzero(ngp_rho)
+    assert sph_rho.max() < ngp_rho.max()
+
+
+def test_sph_rejects_mismatched_arrays():
+    grid = make_grid()
+    with pytest.raises(ValueError, match="same length"):
+        grid.p2g_sph(np.zeros(3), np.zeros(2), np.zeros(3), np.ones(3), [np.ones(3)])
+    with pytest.raises(ValueError, match="at least 1"):
+        grid.p2g_sph(np.zeros(2), np.zeros(2), np.zeros(2), np.ones(2), [np.ones(2)], max_support_cells=0)
+    with pytest.raises(ValueError, match="particles"):
+        grid.p2g_sph(np.zeros(3), np.zeros(3), np.zeros(3), np.ones(3), [np.ones(2)])

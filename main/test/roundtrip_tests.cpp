@@ -31,6 +31,7 @@ const cstone::Box<double> testBox(-0.5, 0.5, cstone::BoundaryType::periodic);
 struct Particles
 {
     std::vector<double>       m, temp;
+    std::vector<double>       x, y, z, h; // positions and smoothing lengths, for SPH
     std::vector<p2g::KeyType> keys;
 
     size_t size() const { return keys.size(); }
@@ -45,20 +46,24 @@ bool loadTurb50(Particles& p)
     std::unique_ptr<IFileReader> reader = makeH5PartReader(MPI_COMM_WORLD);
     reader->setStep(path, 0, FileMode::collective);
 
-    const size_t      n = reader->localNumParticles();
-    std::vector<double> x(n), y(n), z(n);
+    const size_t n = reader->localNumParticles();
+    p.x.resize(n);
+    p.y.resize(n);
+    p.z.resize(n);
+    p.h.resize(n);
     p.m.resize(n);
     p.temp.resize(n);
-    reader->readField("x", x.data());
-    reader->readField("y", y.data());
-    reader->readField("z", z.data());
+    reader->readField("x", p.x.data());
+    reader->readField("y", p.y.data());
+    reader->readField("z", p.z.data());
+    reader->readField("h", p.h.data());
     reader->readField("m", p.m.data());
     reader->readField("temp", p.temp.data());
     reader->closeStep();
 
     p.keys.resize(n);
     for (size_t i = 0; i < n; ++i)
-        p.keys[i] = cstone::sfc3D<cstone::SfcKind<p2g::KeyType>>(x[i], y[i], z[i], testBox);
+        p.keys[i] = cstone::sfc3D<cstone::SfcKind<p2g::KeyType>>(p.x[i], p.y[i], p.z[i], testBox);
 
     return true;
 }
@@ -351,5 +356,89 @@ TEST(Density, ConservesTotalMassOnRealData)
         if (rank == 0)
             std::cout << "gridDim=" << gridDim << ": density range [" << globalMin << ", " << globalMax << "]"
                       << std::endl;
+    }
+}
+
+// SPH deposition on real data, across ranks. Particles near a slab boundary spread into cells
+// owned by other ranks, so this exercises the weighted exchange that nearest-cell binning skips.
+TEST(Sph, ConservesMassAcrossRanksOnRealData)
+{
+    int rank = 0, numRanks = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
+
+    Particles p;
+    if (!loadTurb50(p)) GTEST_SKIP() << "Test data file not found: " TEST_DATA_DIR "/turb_50.h5";
+
+    const double particleMass = globalSum(p.m);
+    double       hMin = 1e300, hMax = -1e300;
+    for (double h : p.h)
+    {
+        hMin = std::min(hMin, h);
+        hMax = std::max(hMax, h);
+    }
+
+    for (int gridDim : {16, 32})
+    {
+        if (gridDim % numRanks != 0) continue;
+
+        p2g::CartesianGrid<double> grid(rank, numRanks, gridDim, -0.5, 0.5);
+        grid.ensureNumFields(2);
+        grid.setReduction(0, p2g::Reduction::Density);
+        grid.setReduction(1, p2g::Reduction::Mean);
+
+        std::vector<std::vector<double>*> fields{&p.m, &p.temp};
+        grid.p2gSph(p.x, p.y, p.z, p.h, fields);
+
+        double localMass = 0.0, localPeak = 0.0;
+        size_t localOccupied = 0;
+        for (double rho : grid.dens())
+        {
+            localMass += rho * grid.cellVolume();
+            localPeak = std::max(localPeak, rho);
+            localOccupied += (rho != 0.0);
+        }
+        double gridMass = 0.0;
+        MPI_Allreduce(&localMass, &gridMass, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        EXPECT_LT(relError(gridMass, particleMass), 1e-10)
+            << "gridDim=" << gridDim << ": SPH lost mass across ranks";
+
+        // Temperatures must stay inside the range of the inputs: a weighted average cannot
+        // exceed its samples, and a wrong normalisation would show up here immediately.
+        double localTempMax = 0.0, inputTempMax = 0.0;
+        for (double t : grid.grid_fields_[1])
+            localTempMax = std::max(localTempMax, t);
+        for (double t : p.temp)
+            inputTempMax = std::max(inputTempMax, t);
+        double tempMax = 0.0, inputMax = 0.0;
+        MPI_Allreduce(&localTempMax, &tempMax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(&inputTempMax, &inputMax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        EXPECT_LE(tempMax, inputMax * (1 + 1e-12)) << "gridDim=" << gridDim << ": weighted mean out of range";
+
+        // Compare against nearest-cell binning on the same data.
+        p2g::CartesianGrid<double> ngp(rank, numRanks, gridDim, -0.5, 0.5);
+        ngp.setReduction(0, p2g::Reduction::Density);
+        std::vector<std::vector<double>*> massOnly{&p.m};
+        ngp.p2g(p.keys, massOnly);
+
+        double ngpLocalPeak = 0.0;
+        size_t ngpOccupied  = 0;
+        for (double rho : ngp.dens())
+        {
+            ngpLocalPeak = std::max(ngpLocalPeak, rho);
+            ngpOccupied += (rho != 0.0);
+        }
+        double   sphPeak = 0.0, ngpPeak = 0.0;
+        uint64_t sphCells = 0, ngpCells = 0;
+        MPI_Allreduce(&localPeak, &sphPeak, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(&ngpLocalPeak, &ngpPeak, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        uint64_t sphLocal = localOccupied, ngpLocal = ngpOccupied;
+        MPI_Allreduce(&sphLocal, &sphCells, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(&ngpLocal, &ngpCells, 1, MPI_UINT64_T, MPI_SUM, MPI_COMM_WORLD);
+
+        if (rank == 0)
+            std::cout << "gridDim=" << gridDim << ": h in [" << hMin << ", " << hMax << "], cell "
+                      << grid.cellSize() << " | occupied cells sph=" << sphCells << " ngp=" << ngpCells
+                      << " | peak density sph=" << sphPeak << " ngp=" << ngpPeak << std::endl;
     }
 }

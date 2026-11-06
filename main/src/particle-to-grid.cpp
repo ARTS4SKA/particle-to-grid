@@ -21,12 +21,19 @@ void printHelp(const char* name)
     printf("  --rhoCrit <rho>         Critical density for TIPSY mass scaling\n");
     printf("  --gridSize <n>          Mesh dimension (default: 2^ceil(log2(cbrt(N))))\n");
     printf("  --field <name>[,name]   Extra particle fields to rasterize (e.g. temp,vx)\n");
+    printf("  --interpolation <m>     'ngp' (default) or 'sph'\n");
+    printf("  --maxSupportCells <n>   SPH stencil half-width cap, in cells (default 8)\n");
     printf("  --output-format <fmt>   'text' (default) or 'hdf5'\n");
     printf("  --output <path>         Output base name (default: 'density')\n");
     printf("  --no-output             Do not write output files\n");
     printf("  -h, --help              This help\n\n");
     printf("Mass is summed per cell and divided by the cell volume, giving a mass density that\n");
     printf("conserves total mass. Extra fields are averaged over the particles in the cell.\n\n");
+    printf("Interpolation:\n");
+    printf("  ngp  each particle lands in the single cell containing it.\n");
+    printf("  sph  each particle is spread over the cells within its kernel support (2h), using\n");
+    printf("       the cubic spline and the 'h' field from the checkpoint. Needs h to be present\n");
+    printf("       and larger than a cell to differ from ngp; both conserve total mass.\n\n");
 }
 
 p2g::Config parseConfig(const ArgParser& parser)
@@ -39,6 +46,8 @@ p2g::Config parseConfig(const ArgParser& parser)
     config.lbox              = parser.get("--lbox", 0.0);
     config.rho_crit          = parser.get("--rhoCrit", 0.0);
     config.extra_field_names = parser.getCommaList("--field");
+    config.interpolation     = p2g::parseInterpolation(parser.get("--interpolation", std::string("ngp")));
+    config.max_support_cells = parser.get("--maxSupportCells", 8);
     config.write_output      = !parser.exists("--no-output");
     config.output_path       = parser.get("--output", std::string("density"));
     config.output_format     = p2g::parseOutputFormat(parser.get("--output-format", std::string("text")));

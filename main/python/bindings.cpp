@@ -192,6 +192,27 @@ py::object gridP2G(Grid& grid, const KArray& keysArr, const py::sequence& fields
     return toArrayList(resStorage);
 }
 
+void gridP2GSph(Grid& grid, const DArray& x, const DArray& y, const DArray& z, const DArray& h,
+                const py::sequence& fields, int maxSupportCells, bool periodic)
+{
+    const size_t n = static_cast<size_t>(x.size());
+    if (static_cast<size_t>(y.size()) != n || static_cast<size_t>(z.size()) != n ||
+        static_cast<size_t>(h.size()) != n)
+        throw std::invalid_argument("x, y, z and h must have the same length");
+    if (maxSupportCells < 1) throw std::invalid_argument("max_support_cells must be at least 1");
+
+    auto xs = toVector(x, "x");
+    auto ys = toVector(y, "y");
+    auto zs = toVector(z, "z");
+    auto hs = toVector(h, "h");
+
+    auto storage = collectFields(fields, n);
+    auto ptrs    = pointersTo(storage);
+
+    py::gil_scoped_release unlock;
+    grid.p2gSph(xs, ys, zs, hs, ptrs, maxSupportCells, periodic);
+}
+
 py::list gridG2P(Grid& grid, const KArray& keysArr, std::optional<size_t> numFields,
                  const std::optional<py::sequence>& residuals)
 {
@@ -305,6 +326,11 @@ PYBIND11_MODULE(particle_to_grid, m)
         "slab_rank", [](int k, int gridDim, int numRanks) { return p2g::slabRank(k, gridDim, numRanks); },
         py::arg("k"), py::arg("grid_dim"), py::arg("num_ranks"), "Rank owning the z-slab that contains plane k.");
 
+    m.def("sph_kernel", py::vectorize([](double r, double h) { return p2g::sphKernel(r, h); }), py::arg("r"),
+          py::arg("h"),
+          "Monaghan M4 cubic spline with support radius 2h, normalised so its integral over space is 1.\n"
+          "Accepts scalars or arrays.");
+
     m.def("density", &densityFromPositions, py::arg("x"), py::arg("y"), py::arg("z"), py::arg("mass"),
           py::arg("grid_dim"), py::arg("lmin") = -0.5, py::arg("lmax") = 0.5,
           "Mass density on this rank's slab, computed from particle positions and masses in one call.");
@@ -332,6 +358,13 @@ PYBIND11_MODULE(particle_to_grid, m)
              "Scatter particle fields onto the grid. `fields` is a sequence of per-particle arrays.\n"
              "With residuals=True, returns a list of per-particle residual arrays which g2p can use to\n"
              "reconstruct the inputs exactly; residuals require every field to use Reduction.Mean.")
+        .def("p2g_sph", &gridP2GSph, py::arg("x"), py::arg("y"), py::arg("z"), py::arg("h"), py::arg("fields"),
+             py::arg("max_support_cells") = 8, py::arg("periodic") = true,
+             "Spread each particle over the cells within its kernel support (2h) using the cubic\n"
+             "spline, instead of binning it into one cell. Needs positions and smoothing lengths.\n"
+             "Weights are normalised per particle, so total mass is conserved exactly; a particle\n"
+             "whose h is below the cell size lands entirely in its own cell. Density fields become\n"
+             "sum(v*w)/cell_volume, Mean fields the kernel-weighted average. CPU only.")
         .def("g2p", &gridG2P, py::arg("keys"), py::arg("num_fields") = py::none(), py::arg("residuals") = py::none(),
              "Gather grid values back to particles, returning a list of arrays. Pass the residuals from\n"
              "p2g to recover the original per-particle values instead of the cell value.")

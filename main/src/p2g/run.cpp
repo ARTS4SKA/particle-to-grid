@@ -188,7 +188,23 @@ void run(const Config& config, int rank, int numRanks)
     grid.ensureNumFields(numFields);
     // Field 0 is mass, so the cell gets a mass density; the extras stay per-cell averages.
     grid.setReduction(0, Reduction::Density);
-    grid.p2g(keys, field_ptrs);
+
+    if (config.interpolation == Interpolation::Sph)
+    {
+        ownedOnly(h);
+        const bool haveH = std::any_of(h.begin(), h.end(), [](T v) { return v > T(0); });
+        if (!haveH && rank == 0)
+            std::cerr << "Warning: --interpolation sph but no positive 'h' in the checkpoint; "
+                         "every particle falls back to its own cell.\n";
+        ownedOnly(x);
+        ownedOnly(y);
+        ownedOnly(z);
+        grid.p2gSph(x, y, z, h, field_ptrs, config.max_support_cells);
+    }
+    else
+    {
+        grid.p2g(keys, field_ptrs);
+    }
 
     // Mass conservation: summing the density back up must return the total particle mass.
     {

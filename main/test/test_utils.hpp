@@ -1,6 +1,16 @@
 #pragma once
 
+
+#include <algorithm>
+#include <cmath>
 #include "mesh.hpp"
+
+// Cell index containing position p in a unit box [0, 1] split into grid_dim cells.
+inline int grid_cell(double p, int gridDim)
+{
+    int i = static_cast<int>(p * gridDim);
+    return std::max(0, std::min(i, gridDim - 1));
+}
 
 // Hilbert key at the center of cell (ci, cj, ck); inverse of p2g::keyToCell.
 inline p2g::KeyType cellToKey(int ci, int cj, int ck, int gridDim)
