@@ -11,6 +11,11 @@ bin/*
 # Ignore files created for tests
 test/constants.txt
 
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # Ignore Mac specific files
 .DS_Store
 

@@ -1,0 +1,21 @@
+# Python dependencies for the particle_to_grid module.
+#
+# Build time (needed when CMake configures the bindings):
+#   pybind11 — provides the headers and the CMake config package
+#   Python development headers — python3-dev / python3-devel, or a conda python
+#
+# Run time:
+#   numpy    — all array arguments and return values
+#
+# Tests:
+#   pytest   — serial test suite (tests/test_bindings.py)
+#   mpi4py   — multi-rank test (tests/mpi_bindings.py); without it the checks that
+#              need a cross-rank sum report SKIPPED instead of passing silently
+#
+# Optional, for reading checkpoints in Python instead of using the CLI:
+#   h5py
+
+pybind11>=2.10
+numpy>=1.20
+pytest>=7.0
+mpi4py>=3.1

@@ -79,6 +79,28 @@ if(ENABLE_H5PART)
     endif()
 endif()
 
+option(BUILD_PYTHON_BINDINGS "build the particle_to_grid python module" ON)
+
+if(BUILD_PYTHON_BINDINGS)
+    find_package(Python 3.8 COMPONENTS Interpreter Development.Module)
+
+    if(Python_FOUND)
+        # Prefer the pybind11 shipped with the active interpreter, so the module is built against
+        # the same Python that will import it; fall back to a system/CMake-visible install.
+        execute_process(COMMAND ${Python_EXECUTABLE} -m pybind11 --cmakedir
+            OUTPUT_VARIABLE pybind11_python_dir OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        find_package(pybind11 CONFIG QUIET HINTS ${pybind11_python_dir})
+    endif()
+
+    if(Python_FOUND AND pybind11_FOUND)
+        message(STATUS "Python bindings enabled (${Python_EXECUTABLE}, pybind11 ${pybind11_VERSION})")
+    else()
+        message(STATUS "No python bindings: need Python >= 3.8 with development headers and pybind11 "
+                       "(pip install pybind11). Set -DBUILD_PYTHON_BINDINGS=OFF to silence this.")
+        set(BUILD_PYTHON_BINDINGS OFF)
+    endif()
+endif()
+
 add_subdirectory(cstone)
 add_subdirectory(extern/io)
 add_subdirectory(main)
