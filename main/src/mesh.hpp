@@ -40,6 +40,15 @@ HOST_DEVICE_FUN inline uint64_t slabLocalIndex(int i, int j, int k, int gridDim,
     return i + static_cast<uint64_t>(j) * gridDim + localK * gridDim * gridDim;
 }
 
+// How a field's per-cell contributions are combined.
+//   Mean    — arithmetic mean over the particles in the cell. Right for intensive quantities
+//             (temperature, velocity): the average of the values present.
+//   Density — total of the particle values divided by the cell volume. Right for extensive
+//             quantities (mass): summing mass and dividing by volume gives a mass density, and
+//             total mass is conserved. Averaging mass instead yields the mean particle mass,
+//             which for equal-mass particles is the same constant in every occupied cell.
+enum class Reduction { Mean, Density };
+
 template<typename T>
 class CartesianGrid;
 
@@ -90,9 +99,20 @@ public:
     std::vector<T>&       dens() { return grid_fields_[0]; }
     const std::vector<T>& dens() const { return grid_fields_[0]; }
 
+    T cellVolume() const
+    {
+        const T dx = (Lmax_ - Lmin_) / static_cast<T>(gridDim_);
+        return dx * dx * dx;
+    }
+
+    // Fields default to Mean; set Density on the mass field to get a mass density.
+    void      setReduction(size_t field, Reduction r) { reductions_.at(field) = r; }
+    Reduction reduction(size_t field) const { return reductions_.at(field); }
+
     void ensureNumFields(size_t n)
     {
         if (grid_fields_.size() < n) grid_fields_.resize(n, std::vector<T>(localSize_, T(0)));
+        if (reductions_.size() < n) reductions_.resize(n, Reduction::Mean);
         for (auto& perField : send_values_)
             if (perField.size() < n) perField.resize(n);
     }
@@ -127,8 +147,51 @@ public:
                     send_values_[r][f].push_back((*field_ptrs[f])[p]);
             }
         }
-        exchangeAndAverage(0, nFields);
+        exchangeAndReduce(0, nFields);
 #endif
+    }
+
+    // Invertible P2G: the grid still holds cell means, and `residual_ptrs[f][p]` receives
+    // v[f][p] - mean(cell(p)), the part the mean alone cannot represent. Passing those residuals
+    // back to g2p() reconstructs the input. A cell holding n particles has one mean and n-1
+    // independent residuals, so (grid, residuals) carries exactly as many numbers as the input:
+    // this is a change of basis, not extra information.
+    // Each residual array must have one entry per particle.
+    void p2g(const std::vector<KeyType>& keys, const std::vector<std::vector<T>*>& field_ptrs,
+             std::vector<std::vector<T>*>& residual_ptrs)
+    {
+        assert(residual_ptrs.size() == field_ptrs.size());
+        ensureNumFields(field_ptrs.size());
+        // A residual is v - mean(cell), so the cell has to hold that mean. For a Density field
+        // the cell holds mass/volume instead, and the difference would be meaningless.
+        for (size_t f = 0; f < field_ptrs.size(); ++f)
+            assert(reductions_[f] == Reduction::Mean);
+        p2g(keys, field_ptrs);
+
+        // A particle's cell may live on another rank, so the means come back through the g2p path.
+        g2p(keys, residual_ptrs);
+        for (size_t f = 0; f < residual_ptrs.size(); ++f)
+        {
+            assert(residual_ptrs[f]->size() == keys.size());
+            for (size_t p = 0; p < keys.size(); ++p)
+                (*residual_ptrs[f])[p] = (*field_ptrs[f])[p] - (*residual_ptrs[f])[p];
+        }
+    }
+
+    // Inverse of p2g(keys, fields, residuals): returns mean(cell(p)) + residual[p] == the original
+    // value. Without the residuals, g2p() returns only the cell mean.
+    void g2p(const std::vector<KeyType>& keys, std::vector<std::vector<T>*>& out_field_ptrs,
+             const std::vector<std::vector<T>*>& residual_ptrs)
+    {
+        assert(residual_ptrs.size() == out_field_ptrs.size());
+        g2p(keys, out_field_ptrs);
+
+        for (size_t f = 0; f < out_field_ptrs.size(); ++f)
+        {
+            assert(residual_ptrs[f]->size() == keys.size());
+            for (size_t p = 0; p < keys.size(); ++p)
+                (*out_field_ptrs[f])[p] += (*residual_ptrs[f])[p];
+        }
     }
 
     void g2p(const std::vector<KeyType>& keys, std::vector<std::vector<T>*>& out_field_ptrs)
@@ -191,8 +254,9 @@ public:
         }
     }
 
-    // Deliver staged remote contributions to their owners, then turn sums into cell means.
-    void exchangeAndAverage(size_t firstField, size_t nFields)
+    // Deliver staged remote contributions to their owners, then reduce each field's accumulated
+    // sum according to its Reduction.
+    void exchangeAndReduce(size_t firstField, size_t nFields)
     {
         std::vector<T> sendValues;
         for (int r = 0; r < numRanks_; ++r)
@@ -212,15 +276,28 @@ public:
             cell_counts_[recvIndex[j]]++;
         }
 
+        const T invVolume = T(1) / cellVolume();
+        for (size_t f = firstField; f < firstField + nFields; ++f)
+        {
+            if (reductions_[f] == Reduction::Density)
+            {
+                // Mass stays summed; only the volume divides it. Empty cells keep a density of 0.
 #pragma omp parallel for
-        for (size_t c = 0; c < localSize_; ++c)
-            if (cell_counts_[c] > 0)
-                for (size_t f = firstField; f < firstField + nFields; ++f)
-                    grid_fields_[f][c] /= static_cast<T>(cell_counts_[c]);
+                for (size_t c = 0; c < localSize_; ++c)
+                    grid_fields_[f][c] *= invVolume;
+            }
+            else
+            {
+#pragma omp parallel for
+                for (size_t c = 0; c < localSize_; ++c)
+                    if (cell_counts_[c] > 0) grid_fields_[f][c] /= static_cast<T>(cell_counts_[c]);
+            }
+        }
     }
 
 private:
-    size_t localSize_;
+    size_t                 localSize_;
+    std::vector<Reduction> reductions_;
 
     template<class V>
     static std::vector<int> bucketSizes(const std::vector<std::vector<V>>& buckets)

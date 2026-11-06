@@ -120,7 +120,7 @@ void cuda_p2g(CartesianGrid<T>& grid, const std::vector<KeyType>& keys,
             }
         }
 
-        grid.exchangeAndAverage(f, 1);
+        grid.exchangeAndReduce(f, 1);
     }
 
     if (n > 0)

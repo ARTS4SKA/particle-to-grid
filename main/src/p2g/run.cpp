@@ -185,7 +185,24 @@ void run(const Config& config, int rank, int numRanks)
     }
 
     CartesianGrid<T> grid(rank, numRanks, gridDim, boxMin, boxMax);
+    grid.ensureNumFields(numFields);
+    // Field 0 is mass, so the cell gets a mass density; the extras stay per-cell averages.
+    grid.setReduction(0, Reduction::Density);
     grid.p2g(keys, field_ptrs);
+
+    // Mass conservation: summing the density back up must return the total particle mass.
+    {
+        double localMass = 0.0, localGrid = 0.0;
+        for (size_t i = 0; i < keys.size(); ++i)
+            localMass += fields[0][i];
+        for (T rho : grid.grid_fields_[0])
+            localGrid += rho * grid.cellVolume();
+        double totals[2] = {0, 0}, locals[2] = {localMass, localGrid};
+        MPI_Reduce(locals, totals, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+            std::cout << "Total mass: particles=" << totals[0] << " grid=" << totals[1]
+                      << " (relative difference " << std::abs(totals[1] - totals[0]) / totals[0] << ")" << std::endl;
+    }
 
     float t_p2g   = timer.elapsed("P2G rasterization");
     float t_write = 0.f;
