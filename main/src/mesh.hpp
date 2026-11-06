@@ -111,7 +111,16 @@ public:
 
     void ensureNumFields(size_t n)
     {
-        if (grid_fields_.size() < n) grid_fields_.resize(n, std::vector<T>(localSize_, T(0)));
+        if (grid_fields_.size() < n)
+        {
+            // Each field is allocated in place. Passing a filled vector to resize() would build
+            // one temporary and copy it into every new slot, doubling peak memory -- 16 GiB
+            // instead of 8 for a 1024^3 grid of doubles.
+            const size_t first = grid_fields_.size();
+            grid_fields_.resize(n);
+            for (size_t f = first; f < n; ++f)
+                grid_fields_[f].assign(localSize_, T(0));
+        }
         if (reductions_.size() < n) reductions_.resize(n, Reduction::Mean);
         for (auto& perField : send_values_)
             if (perField.size() < n) perField.resize(n);
@@ -138,7 +147,7 @@ public:
             {
                 for (size_t f = 0; f < nFields; ++f)
                     grid_fields_[f][idx] += (*field_ptrs[f])[p];
-                cell_counts_[idx]++;
+                if (needCounts_) cell_counts_[idx]++;
             }
             else
             {
@@ -241,11 +250,25 @@ public:
     // The two steps below bracket the per-particle binning; the CUDA backend calls them
     // once per field, the CPU path once for all fields.
 
+    // Whether this transfer needs a particle count per cell. Only Mean does; skipping it saves
+    // 4 bytes per cell, which is 4 GiB on a 1024^3 grid.
+    bool needsCellCounts() const { return needCounts_; }
+
     void resetAccumulation(size_t firstField, size_t nFields)
     {
         for (size_t f = firstField; f < firstField + nFields; ++f)
             std::fill(grid_fields_[f].begin(), grid_fields_[f].end(), T(0));
-        cell_counts_.assign(localSize_, 0);
+
+        needCounts_ = false;
+        for (size_t f = firstField; f < firstField + nFields; ++f)
+            needCounts_ = needCounts_ || reductions_[f] == Reduction::Mean;
+
+        if (needCounts_) { cell_counts_.assign(localSize_, 0); }
+        else
+        {
+            cell_counts_.clear();
+            cell_counts_.shrink_to_fit();
+        }
         for (int r = 0; r < numRanks_; ++r)
         {
             send_index_[r].clear();
@@ -273,7 +296,7 @@ public:
         {
             for (size_t f = 0; f < nFields; ++f)
                 grid_fields_[firstField + f][recvIndex[j]] += recvValues[j * nFields + f];
-            cell_counts_[recvIndex[j]]++;
+            if (needCounts_) cell_counts_[recvIndex[j]]++;
         }
 
         const T invVolume = T(1) / cellVolume();
@@ -298,6 +321,7 @@ public:
 private:
     size_t                 localSize_;
     std::vector<Reduction> reductions_;
+    bool                   needCounts_{true};
 
     template<class V>
     static std::vector<int> bucketSizes(const std::vector<std::vector<V>>& buckets)

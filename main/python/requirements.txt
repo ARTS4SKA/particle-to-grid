@@ -11,11 +11,11 @@
 #   pytest   — serial test suite (tests/test_bindings.py)
 #   mpi4py   — multi-rank test (tests/mpi_bindings.py); without it the checks that
 #              need a cross-rank sum report SKIPPED instead of passing silently
-#
-# Optional, for reading checkpoints in Python instead of using the CLI:
-#   h5py
+#   h5py     — reading checkpoints and writing grids from Python
+#              (tests/test_cdm_density.py)
 
 pybind11>=2.10
 numpy>=1.20
 pytest>=7.0
 mpi4py>=3.1
+h5py>=3.0

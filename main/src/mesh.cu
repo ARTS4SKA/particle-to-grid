@@ -95,8 +95,10 @@ void cuda_p2g(CartesianGrid<T>& grid, const std::vector<KeyType>& keys,
 
             checkCudaError(cudaMemcpy(grid.grid_fields_[f].data(), d_grid, localSize * sizeof(T),
                                       cudaMemcpyDeviceToHost), "grid back");
-            checkCudaError(cudaMemcpy(grid.cell_counts_.data(), d_counts, localSize * sizeof(int),
-                                      cudaMemcpyDeviceToHost), "counts back");
+            // Density needs no per-cell counts, and the host vector is left unallocated for it.
+            if (grid.needsCellCounts())
+                checkCudaError(cudaMemcpy(grid.cell_counts_.data(), d_counts, localSize * sizeof(int),
+                                          cudaMemcpyDeviceToHost), "counts back");
 
             int numRemote = 0;
             checkCudaError(cudaMemcpy(&numRemote, d_remoteCount, sizeof(int), cudaMemcpyDeviceToHost),

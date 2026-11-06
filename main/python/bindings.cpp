@@ -225,12 +225,29 @@ py::list gridG2P(Grid& grid, const KArray& keysArr, std::optional<size_t> numFie
     return toArrayList(storage);
 }
 
-DArray gridField(const Grid& grid, size_t f)
+void checkFieldIndex(const Grid& grid, size_t f)
 {
     if (f >= grid.numFields())
         throw std::out_of_range("field " + std::to_string(f) + " does not exist; the grid holds " +
                                 std::to_string(grid.numFields()));
+}
+
+DArray gridField(const Grid& grid, size_t f)
+{
+    checkFieldIndex(grid, f);
     return toArray(grid.grid_fields_[f]);
+}
+
+// Zero-copy view of a field. Matters at large grid_dim, where copying a slab can double peak
+// memory (a 1024^3 grid of doubles is 8 GiB). The returned array borrows the grid's buffer and
+// keeps the grid alive; it is invalidated by anything that reallocates, i.e. ensure_num_fields()
+// growing the field count. p2g() and g2p() overwrite in place and keep it valid.
+py::array_t<double> gridFieldView(Grid& grid, size_t f)
+{
+    checkFieldIndex(grid, f);
+    auto& field = grid.grid_fields_[f];
+    return py::array_t<double>({static_cast<py::ssize_t>(field.size())}, {sizeof(double)}, field.data(),
+                               py::cast(&grid));
 }
 
 // One-shot convenience: positions and masses in, this rank's slab of mass density out.
@@ -319,6 +336,9 @@ PYBIND11_MODULE(particle_to_grid, m)
              "Gather grid values back to particles, returning a list of arrays. Pass the residuals from\n"
              "p2g to recover the original per-particle values instead of the cell value.")
         .def("field", &gridField, py::arg("field"), "This rank's slab of field `field`, as a copy.")
+        .def("field_view", &gridFieldView, py::arg("field"),
+             "This rank's slab of field `field` without copying, for large grids. The array borrows\n"
+             "the grid's memory and keeps the grid alive; ensure_num_fields() may invalidate it.")
         .def("__repr__",
              [](const Grid& g)
              {
