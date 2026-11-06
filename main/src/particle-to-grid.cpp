@@ -25,7 +25,8 @@ void printHelp(const char* name)
     printf("  --output <path>         Output base name (default: 'density')\n");
     printf("  --no-output             Do not write output files\n");
     printf("  -h, --help              This help\n\n");
-    printf("Each grid cell receives the mean of the particles mapped to it (cell-average).\n\n");
+    printf("Mass is summed per cell and divided by the cell volume, giving a mass density that\n");
+    printf("conserves total mass. Extra fields are averaged over the particles in the cell.\n\n");
 }
 
 p2g::Config parseConfig(const ArgParser& parser)

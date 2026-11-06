@@ -175,6 +175,14 @@ py::object gridP2G(Grid& grid, const KArray& keysArr, const py::sequence& fields
         return py::none();
     }
 
+    // Checked here rather than left to the C++ assert: a wrong call from Python must raise,
+    // not abort the interpreter, and the assert disappears entirely under NDEBUG.
+    for (size_t f = 0; f < storage.size(); ++f)
+        if (grid.reduction(f) != p2g::Reduction::Mean)
+            throw std::invalid_argument("residuals need field " + std::to_string(f) +
+                                        " to use Reduction.Mean, because a residual is the deviation from the "
+                                        "cell mean; it currently uses Reduction.Density");
+
     std::vector<std::vector<double>> resStorage(storage.size(), std::vector<double>(keys.size(), 0.0));
     auto                             resPtrs = pointersTo(resStorage);
     {

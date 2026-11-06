@@ -178,12 +178,19 @@ def test_residuals_round_trip_many_particles_per_cell():
 
 
 def test_residuals_rejected_for_density_fields():
+    """A residual is a deviation from the cell mean, which a Density field does not hold.
+
+    This must raise rather than abort the interpreter, and must not depend on C++ asserts
+    being compiled in.
+    """
     grid = make_grid()
     grid.set_reduction(0, p2g.Reduction.Density)
     keys = keys_for_cells([(0, 0, 0)])
-    # A residual is defined against the cell mean, which a Density field does not hold.
-    # The C++ layer asserts this; in a release build the assert is compiled out, so only
-    # check that asking for residuals on a Mean field is what works.
+
+    with pytest.raises(ValueError, match="Reduction.Mean"):
+        grid.p2g(keys, [np.array([1.0])], residuals=True)
+
+    # The same call on a Mean field is fine.
     grid_mean = make_grid()
     assert grid_mean.reduction(0) == p2g.Reduction.Mean
     assert grid_mean.p2g(keys, [np.array([1.0])], residuals=True) is not None
